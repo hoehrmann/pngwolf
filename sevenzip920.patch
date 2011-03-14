@@ -1,6 +1,6 @@
-diff -pur 7zip-old/C/Alloc.c 7zip-new/C/Alloc.c
---- 7zip-old/C/Alloc.c	2008-09-24 14:51:47.000000000 +0200
-+++ 7zip-new/C/Alloc.c	2011-03-14 01:52:44.916600000 +0100
+diff -pur 7zip/C/Alloc.c 7zip/C/Alloc.c
+--- 7zip/C/Alloc.c	2008-09-24 14:51:47.000000000 +0200
++++ 7zip/C/Alloc.c	2011-03-14 01:52:44.916600000 +0100
 @@ -6,7 +6,6 @@ Public domain */
  #ifdef _WIN32
  #include <windows.h>
@@ -9,9 +9,9 @@ diff -pur 7zip-old/C/Alloc.c 7zip-new/C/Alloc.c
  
  #include "Alloc.h"
  
-diff -pur 7zip-old/C/Alloc.h 7zip-new/C/Alloc.h
---- 7zip-old/C/Alloc.h	2009-02-07 07:44:34.000000000 +0100
-+++ 7zip-new/C/Alloc.h	2011-03-14 01:52:38.246600000 +0100
+diff -pur 7zip/C/Alloc.h 7zip/C/Alloc.h
+--- 7zip/C/Alloc.h	2009-02-07 07:44:34.000000000 +0100
++++ 7zip/C/Alloc.h	2011-03-14 01:52:38.246600000 +0100
 @@ -5,6 +5,7 @@
  #define __COMMON_ALLOC_H
  
@@ -20,9 +20,9 @@ diff -pur 7zip-old/C/Alloc.h 7zip-new/C/Alloc.h
  
  #ifdef __cplusplus
  extern "C" {
-diff -pur 7zip-old/CPP/7zip/Common/StreamObjects.cpp 7zip-new/CPP/7zip/Common/StreamObjects.cpp
---- 7zip-old/CPP/7zip/Common/StreamObjects.cpp	2010-11-02 18:12:26.000000000 +0100
-+++ 7zip-new/CPP/7zip/Common/StreamObjects.cpp	2011-03-05 18:44:51.044851100 +0100
+diff -pur 7zip/CPP/7zip/Common/StreamObjects.cpp 7zip/CPP/7zip/Common/StreamObjects.cpp
+--- 7zip/CPP/7zip/Common/StreamObjects.cpp	2010-11-02 18:12:26.000000000 +0100
++++ 7zip/CPP/7zip/Common/StreamObjects.cpp	2011-03-05 18:44:51.044851100 +0100
 @@ -78,7 +78,7 @@ Byte *CDynBufSeqOutStream::GetBufPtrForW
  void CDynBufSeqOutStream::CopyToBuffer(CByteBuffer &dest) const
  {
