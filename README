@@ -83,9 +83,9 @@ To compile `pngwolf` you need three additional libraries:
 
 Put these into `galib`, `7zip`, and `zlib` sub-directories into the
 directory where pngwolf.cxx is located, and then either use the CMake
-utility (http://www.cmake.org/) on the `CMakefile`, or simply specify
-all the files specified in `CMakefile` as input to your compiler. The
-latter would look like:
+utility (http://www.cmake.org/) on the `CMakeLists.txt`, or simply
+specify all the files specified in `CMakeLists.txt` as input to your
+compiler. The latter would look like:
 
   % gcc -I7zip/CPP -Igalib pngwolf.cxx galib/ga/GA1DArrayGenome.C 
       galib/ga/GAAllele.C ... -lstdc++ -o pngwolf
