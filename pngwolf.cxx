@@ -1286,7 +1286,7 @@ main(int argc, char *argv[]) {
   int argMaxDeflate = 0;
   int argPopulationSize = 19;
 #ifndef _MSC_VER
-  sighandler_t old_handler;
+  sig_t old_handler;
 #endif
 
   // Parse command line parameters
