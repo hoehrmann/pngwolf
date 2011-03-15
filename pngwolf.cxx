@@ -1088,7 +1088,7 @@ bool PngWolf::read_file() {
 
   scanline_width = expected / ihdr.height;
   scanline_delta = channel_map[ihdr.color] *
-    int(ceil(float(ihdr.depth / 8)));
+    int(ceil(float(ihdr.depth / 8.0)));
 
   for (size_t ix = 0; ix < ihdr.height; ++ix) {
     unsigned char filter = original_inflated.at(ix * scanline_width);
@@ -1227,7 +1227,7 @@ help(void) {
     "  --help                         Print this help page and exit                \n"
     "  --in=<path>                    The PNG input image                          \n"
     "  --out=<path>                   The PNG output file (defaults to not saving!)\n"
-    "  --best-idat-to=<path>          Save raw IDAT data with the best filter      \n"
+    "  --best-idat-to=<path>          Save inflated IDAT data with the best filter \n"
     "  --exclude-singles              Exclude single-filter genomes from population\n"
     "  --exclude-original             Exclude the filters of the input image       \n"
     "  --exclude-heuristic            Exclude the heuristically generated filters  \n"
