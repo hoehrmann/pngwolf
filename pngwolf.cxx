@@ -50,6 +50,12 @@
 #include <limits.h>
 #include <math.h>
 
+#ifdef _MSC_VER
+#pragma warning(push, 4)
+#pragma warning(disable: 4996)
+#pragma warning(disable: 4100)
+#endif
+
 ////////////////////////////////////////////////////////////////////
 // Miscellaneous structures and types
 ////////////////////////////////////////////////////////////////////
@@ -115,13 +121,19 @@ public:
   size_t population_size;
   const char* in_path;
   const char* out_path;
-  const char* idat_path;
   bool verbose_analysis;
   bool verbose_summary;
   bool verbose_critters;
   bool exclude_singles;
   bool exclude_original;
   bool exclude_heuristic;
+  int zlib_level;
+  int zlib_windowBits;
+  int zlib_memLevel;
+  int zlib_strategy;
+  int szip_pass;
+  int szip_fast;
+  int szip_cycl;
 
   // User input
   bool should_abort;
@@ -130,6 +142,8 @@ public:
   time_t program_begun_at;
   time_t search_begun_at;
   time_t last_improvement_at;
+  time_t last_step_at;
+  time_t done_deflating_at;
 
   // IDAT
   std::vector<char> original_inflated;
@@ -139,12 +153,9 @@ public:
   //
   unsigned nth_generation;
   unsigned genomes_evaluated;
-  int zlib_level;
-  int zlib_windowBits;
-  int zlib_memLevel;
-  int zlib_strategy;
 
   //
+  std::vector<char> best_inflated;
   std::vector<char> best_deflated;
 
   // The genetic algorithm
@@ -159,9 +170,12 @@ public:
   // Various
   bool read_file();
   bool save_file();
-  bool save_idat();
+  bool save_best_idat(const char* path);
+  bool save_original_idat(const char* path);
+  bool save_idat(const char* path, std::vector<char>& deflated, std::vector<char>& inflated);
   void init_filters();
   void run();
+  void recompress();
   std::vector<char> refilter(PngFilterGenome& ge);
 
   // Constructor
@@ -169,17 +183,14 @@ public:
     should_abort(false),
     nth_generation(0),
     genomes_evaluated(0),
-    zlib_level(5),
-    zlib_windowBits(15),
-    zlib_memLevel(8),
-    zlib_strategy(Z_DEFAULT_STRATEGY),
     ge_all_none(NULL),
     ge_all_avg(NULL),
     ge_all_sub(NULL),
     ge_all_up(NULL),
     ge_all_paeth(NULL),
     ge_heuristic(NULL),
-    ge_original(NULL)
+    ge_original(NULL),
+    done_deflating_at(0)
   {}
 
   ~PngWolf() {
@@ -349,9 +360,7 @@ void unfilter_row_paeth(unsigned char* idat, size_t row, size_t pwidth, size_t b
     idat[xix++] += paeth_predictor(idat[aix++], idat[bix++] , idat[cix++]);
 }
 
-// TODO: rename functions to follow underline+lowercase conventions
-
-void unFilterIdat(unsigned char* idat, size_t rows, size_t pwidth, size_t bytes) {
+void unfilter_idat(unsigned char* idat, size_t rows, size_t pwidth, size_t bytes) {
   size_t row;
   for (row = 0; row < rows; ++row) {
     switch(idat[row*bytes]) {
@@ -376,7 +385,7 @@ void unFilterIdat(unsigned char* idat, size_t rows, size_t pwidth, size_t bytes)
   }
 }
 
-void filterIdat(unsigned char* src, unsigned char* dst, PngFilterGenome& filter, size_t pwidth, size_t bytes) {
+void filter_idat(unsigned char* src, unsigned char* dst, PngFilterGenome& filter, size_t pwidth, size_t bytes) {
   for (int row = 0; row < filter.size(); ++row) {
     switch(filter.gene(row)) {
     case 0:
@@ -397,7 +406,7 @@ void filterIdat(unsigned char* src, unsigned char* dst, PngFilterGenome& filter,
     default:
       assert(!"bad filter type");
     }
-    dst[row*bytes] = filter.gene(row);
+    dst[row*bytes] = (unsigned char)filter.gene(row);
   }
 }
 
@@ -431,12 +440,14 @@ GAAlleleSet<PngFilter>::allele() const {
   return (PngFilter)GARandomInt(lower(), upper());
 }
 
-std::vector<char> deflate_7zip(std::vector<char>& inflated) {
+std::vector<char> deflate_7zip(std::vector<char>& inflated, unsigned pass, unsigned fast, unsigned cycl) {
 
   NCompress::NZlib::CEncoder c;
   PROPID algoProp = NCoderPropID::kAlgorithm;
   PROPID passProp = NCoderPropID::kNumPasses;
   PROPID fastProp = NCoderPropID::kNumFastBytes;
+  PROPID cyclProp = NCoderPropID::kMatchFinderCycles;
+
   PROPVARIANT v;
   v.vt = VT_UI4;
 
@@ -451,12 +462,16 @@ std::vector<char> deflate_7zip(std::vector<char>& inflated) {
   if (d->SetCoderProperties(&algoProp, &v, 1) != S_OK) {
   }
 
-  v.ulVal = 15;
+  v.ulVal = pass;
   if (d->SetCoderProperties(&passProp, &v, 1) != S_OK) {
   }
 
-  v.ulVal = 258;
+  v.ulVal = fast;
   if (d->SetCoderProperties(&fastProp, &v, 1) != S_OK) {
+  }
+
+  v.ulVal = cycl;
+  if (d->SetCoderProperties(&cyclProp, &v, 1) != S_OK) {
   }
 
   CBufInStream* in_buf = new CBufInStream;
@@ -490,8 +505,9 @@ std::vector<char> deflate_zlib(std::vector<char>& inflated) {
   // around and reinitialize it using deflateReset.
   if (deflateInit2(&strm, wolf.zlib_level, Z_DEFLATED,
     wolf.zlib_windowBits, wolf.zlib_memLevel,
-    wolf.zlib_strategy) != Z_OK)
+    wolf.zlib_strategy) != Z_OK) {
     abort();
+  }
 
   strm.next_in = (Bytef*)&inflated[0];
   strm.avail_in = inflated.size();
@@ -520,7 +536,7 @@ std::vector<char> PngWolf::refilter(PngFilterGenome& ge) {
   // need to be modified so they copy all the data first.
   memcpy(&copy[0], &original_unfiltered[0], copy.size());
 
-  filterIdat((unsigned char*)&original_unfiltered[0],
+  filter_idat((unsigned char*)&original_unfiltered[0],
     (unsigned char*)&copy[0], ge,
     scanline_delta, scanline_width);
 
@@ -531,7 +547,7 @@ float Evaluator(GAGenome& genome) {
   PngFilterGenome& ge =
     (PngFilterGenome&)genome;
 
-  // TODO: wolf should be user data
+  // TODO: wolf should be user data, not a global
   if (wolf.should_abort)
     return FLT_MAX;
 
@@ -570,11 +586,11 @@ void PngWolf::log_summary() {
       "total time spent optimizing: %0.0f\n"
       "number of genomes evaluated: %u\n"
       "size of 7zip deflated data:  %u\n"
-      "size difference to original: %u\n",
+      "size difference to original: %d\n",
       difftime(time(NULL), program_begun_at),
       genomes_evaluated,
       best_deflated.size(),
-      abs(diff));
+      -diff);
   }
 
   if (diff >= 0)
@@ -901,6 +917,7 @@ void PngWolf::run() {
     nth_generation++;
 
     ga.step();
+    last_step_at = time(NULL);
 
     PngFilterGenome& new_best =
       (PngFilterGenome&)ga.population().best();
@@ -920,9 +937,13 @@ after_while:
   // on that as soon as possible, so the log header comes here.
   printf("---\n");
   fflush(stdout);
+}
 
-  std::vector<char> refiltered = refilter(*best_genomes.back());
-  best_deflated = deflate_7zip(refiltered);
+void PngWolf::recompress() {
+  best_inflated = refilter(*best_genomes.back());
+  best_deflated = deflate_7zip(best_inflated,
+    szip_pass, szip_fast, szip_cycl);
+  done_deflating_at = time(NULL);
 }
 
 bool PngWolf::read_file() {
@@ -1105,7 +1126,7 @@ bool PngWolf::read_file() {
   memcpy(&original_unfiltered[0],
     &original_inflated[0], original_inflated.size());
 
-  unFilterIdat((unsigned char*)&original_unfiltered[0],
+  unfilter_idat((unsigned char*)&original_unfiltered[0],
     ihdr.height, scanline_delta, scanline_width);
 
   return false;
@@ -1120,15 +1141,46 @@ error:
 ////////////////////////////////////////////////////////////////////
 // Save data
 ////////////////////////////////////////////////////////////////////
-bool PngWolf::save_idat() {
-  FILE* out = fopen(idat_path, "wb");
+bool PngWolf::save_original_idat(const char* path) {
+  return save_idat(path, original_deflated, original_inflated);
+}
+
+bool PngWolf::save_best_idat(const char* path) {
+  return save_idat(path, best_deflated, best_inflated);
+}
+
+bool PngWolf::save_idat(const char* path, std::vector<char>& deflated, std::vector<char>& inflated) {
+
+  // TODO: when there is a simple inflate() function, make this
+  // assert when deflated and inflated to not mach each other.
+  // Or alternatively make some IDAT struct that has both and
+  // then require its use for this function.
+
+  FILE* out = fopen(path, "wb");
+
+  static const uint8_t GZIP_HEADER[] = {
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03
+  };
 
   if (out == NULL)
     return true;
 
-  std::vector<char> refiltered = refilter(*best_genomes.back());
+  if (fwrite(GZIP_HEADER, sizeof(GZIP_HEADER), 1, out) != 1) {
+  }
 
-  if (fwrite(&refiltered[0], refiltered.size(), 1, out) != 1) {
+  if (fwrite(&deflated[2], deflated.size() - 6, 1, out) != 1) {
+  }
+
+  // TODO: endianess?
+
+  uint32_t crc = crc32(0L, Z_NULL, 0);
+  crc = crc32(crc, (Bytef*)&inflated[0], inflated.size());
+
+  if (fwrite(&crc, sizeof(crc), 1, out) != 1) {
+  }
+
+  uint32_t size = inflated.size();
+  if (fwrite(&size, sizeof(size), 1, out) != 1) {
   }
 
   if (fclose(out) != 0) {
@@ -1224,10 +1276,10 @@ help(void) {
     " -----------------------------------------------------------------------------\n"
     " Usage: pngwolf --in=file.png --out=file.png                                  \n"
     " -----------------------------------------------------------------------------\n"
-    "  --help                         Print this help page and exit                \n"
-    "  --in=<path>                    The PNG input image                          \n"
-    "  --out=<path>                   The PNG output file (defaults to not saving!)\n"
-    "  --best-idat-to=<path>          Save inflated IDAT data with the best filter \n"
+    "  --in=<path.png>                The PNG input image                          \n"
+    "  --out=<path.png>               The PNG output file (defaults to not saving!)\n"
+    "  --original-idat-to=<path.gz>   Save original IDAT data in a gzip container  \n"
+    "  --best-idat-to=<path.gz>       Save best IDAT data in a gzip container      \n"
     "  --exclude-singles              Exclude single-filter genomes from population\n"
     "  --exclude-original             Exclude the filters of the input image       \n"
     "  --exclude-heuristic            Exclude the heuristically generated filters  \n"
@@ -1236,11 +1288,19 @@ help(void) {
     "  --max-stagnate-time=<seconds>  Give up after seconds of no improvement      \n"
     "  --max-deflate=<megabytes>      Give up after deflating this many megabytes  \n"
     "  --max-evaluations=<int>        Give up after evaluating this many genomes   \n"
+    "  --zlib-level=<int>             zlib estimator compression level (default: 5)\n"
+    "  --zlib-strategy=<int>          zlib estimator strategy (default: 0)         \n"
+    "  --zlib-window=<int>            zlib estimator window bits (default: 15)     \n"
+    "  --zlib-memlevel=<int>          zlib estimator memory level (default: 8)     \n"
+    "  --7zip-mfb=<int>               7zip fast bytes 3..258 (default: 258)        \n"
+    "  --7zip-mpass=<int>             7zip passes 0..15 (d: 5; > ~ slower, smaller)\n"
+    "  --7zip-mmc=<int>               7zip match finder cycles (d: 258)            \n"
     "  --verbose-analysis             More details in initial image analysis       \n"
     "  --verbose-summary              More details in optimization summary         \n"
     "  --verbose-critter              More details when improvements are found     \n"
     "  --verbose                      Shorthand for all verbosity options          \n"
     "  --info                         Just print out verbose analysis and exit     \n"
+    "  --help                         Print this help page and exit                \n"
     " -----------------------------------------------------------------------------\n"
     " To reduce the file size of PNG images `pngwolf` uses a genetic algorithm for \n"
     " finding the best scanline filter for each scanline in the image. It does not \n"
@@ -1259,7 +1319,7 @@ help(void) {
     " -----------------------------------------------------------------------------\n"
     " Uses http://zlib.net/ and http://lancet.mit.edu/ga/ and http://www.7-zip.org/\n"
     " -----------------------------------------------------------------------------\n"
-    " https://github.com/hoehrmann/pngwolf (c) 2008-2011 http://bjoern.hoehrmann.de\n"
+    " http://bjoern.hoehrmann.de/pngwolf/ (c) 2008-2011 http://bjoern.hoehrmann.de/\n"
     "");
 }
 
@@ -1280,11 +1340,22 @@ main(int argc, char *argv[]) {
   const char* argPng = NULL;
   const char* argOut = NULL;
   const char* argBestIdatTo = NULL;
+  const char* argOriginalIdatTo = NULL;
   int argMaxTime = 120;
   int argMaxStagnateTime = 0;
   int argMaxEvaluations = 0;
   int argMaxDeflate = 0;
   int argPopulationSize = 19;
+  int argZlibLevel = 5;
+  int argZlibStrategy = 0;
+  int argZlibMemory = 8;
+  int argZlibWindow = 15;
+  int arg7zipFastBytes = 258;
+  int arg7zipPasses = 5;
+  int arg7zipCycles = 258;
+
+  bool argOkay = true;;
+
 #ifndef _MSC_VER
   sig_t old_handler;
 #endif
@@ -1341,8 +1412,7 @@ main(int argc, char *argv[]) {
     value = strchr(s, '=');
 
     if (value == NULL) {
-      // TODO: error
-      argHelp = 1;
+      argOkay = false;
       break;
     }
 
@@ -1357,6 +1427,9 @@ main(int argc, char *argv[]) {
 
     } else if (strncmp("--best-idat-to", s, nlen) == 0) {
       argBestIdatTo = value;
+
+    } else if (strncmp("--original-idat-to", s, nlen) == 0) {
+      argOriginalIdatTo = value;
 
     } else if (strncmp("--max-time", s, nlen) == 0) {
       argMaxTime = atoi(value);
@@ -1373,19 +1446,53 @@ main(int argc, char *argv[]) {
     } else if (strncmp("--population-size", s, nlen) == 0) {
       argPopulationSize = atoi(value);
 
+    } else if (strncmp("--zlib-level", s, nlen) == 0) {
+      argZlibLevel = atoi(value);
+      argOkay &= argZlibLevel >= 0;
+      argOkay &= argZlibLevel <= 9;
+
+    } else if (strncmp("--zlib-memory", s, nlen) == 0) {
+      argZlibMemory = atoi(value);
+      argOkay &= argZlibMemory >= 1;
+      argOkay &= argZlibMemory <= 9;
+
+    } else if (strncmp("--zlib-window", s, nlen) == 0) {
+      argZlibWindow = atoi(value);
+      argOkay &= argZlibWindow >= 8;
+      argOkay &= argZlibWindow <= 15;
+
+    } else if (strncmp("--zlib-strategy", s, nlen) == 0) {
+      argZlibStrategy = atoi(value);
+      argOkay &= argZlibStrategy == Z_DEFAULT_STRATEGY
+              || argZlibStrategy == Z_FILTERED
+              || argZlibStrategy == Z_HUFFMAN_ONLY
+              || argZlibStrategy == Z_RLE;
+
+    } else if (strncmp("--7zip-mfb", s, nlen) == 0) {
+      arg7zipFastBytes = atoi(value);
+      argOkay &= arg7zipFastBytes >= 3;
+      argOkay &= arg7zipFastBytes <= 258;
+
+    } else if (strncmp("--7zip-mpass", s, nlen) == 0) {
+      arg7zipPasses = atoi(value);
+      argOkay &= arg7zipPasses >= 1;
+      argOkay &= arg7zipPasses <= 15;
+
+    } else if (strncmp("--7zip-mmc", s, nlen) == 0) {
+      arg7zipCycles = atoi(value);
+
     } else {
       // TODO: error
       argHelp = 1;
     }
   }
 
-  if (argHelp || argPng == NULL) {
+  if (argHelp || argPng == NULL || !argOkay) {
     help();
     return EXIT_SUCCESS;
   }
 
   wolf.in_path = argPng;
-  wolf.idat_path = argBestIdatTo;
   wolf.max_deflate = argMaxDeflate;
   wolf.max_evaluations = argMaxEvaluations;
   wolf.verbose_analysis = argVerboseAnalysis;
@@ -1396,13 +1503,30 @@ main(int argc, char *argv[]) {
   wolf.exclude_singles = argExcludeSingles;
   wolf.population_size = argPopulationSize;
   wolf.max_stagnate_time = argMaxStagnateTime;
+  wolf.last_step_at = time(NULL);
   wolf.last_improvement_at = time(NULL);
   wolf.program_begun_at = time(NULL);
   wolf.max_time = argMaxTime;
   wolf.out_path = argOut;
-  
+  wolf.zlib_level = argZlibLevel;
+  wolf.zlib_memLevel = argZlibMemory;
+  wolf.zlib_strategy = argZlibStrategy;
+  wolf.zlib_windowBits = argZlibWindow;
+  wolf.szip_fast = arg7zipFastBytes;
+  wolf.szip_pass = arg7zipPasses;
+  wolf.szip_cycl = arg7zipCycles;
+
+  // TODO: ...
+  try {
   if (wolf.read_file())
     goto error;
+  } catch (...) {
+    goto error;
+  }
+
+  if (argOriginalIdatTo != NULL)
+    if (wolf.save_original_idat(argOriginalIdatTo))
+      goto out_error;
 
   wolf.init_filters();
   wolf.log_analysis();
@@ -1420,21 +1544,29 @@ main(int argc, char *argv[]) {
 
   wolf.run();
 
-  if (wolf.out_path)
-    if (wolf.save_file())
-      goto out_error;
-
-  if (wolf.idat_path)
-    if (wolf.save_idat())
-      goto out_error;
-
-  wolf.log_summary();
+  // Uninstall the SIGINT interceptor to allow users to abort
+  // the possibly very slow recompression step. This may lead
+  // to users unintentionally hit CTRL+C twice, but there is
+  // not much to avoid that, other than setting a timer with
+  // some grace perdiod which strikes me as too complicated.
 
 #ifdef _MSC_VER
   SetConsoleCtrlHandler(console_event_handler, FALSE);
 #else
   signal(SIGINT, old_handler);
 #endif
+
+  wolf.recompress();
+
+  if (wolf.out_path)
+    if (wolf.save_file())
+      goto out_error;
+
+  if (argBestIdatTo != NULL)
+    if (wolf.save_best_idat(argBestIdatTo))
+      goto out_error;
+
+  wolf.log_summary();
 
 done:
 
