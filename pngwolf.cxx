@@ -49,6 +49,7 @@
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <map>
 
 #ifdef _MSC_VER
 #pragma warning(push, 4)
@@ -127,6 +128,7 @@ public:
   bool exclude_singles;
   bool exclude_original;
   bool exclude_heuristic;
+  bool normalize_alpha;
   int zlib_level;
   int zlib_windowBits;
   int zlib_memLevel;
@@ -149,6 +151,9 @@ public:
   std::vector<char> original_inflated;
   std::vector<char> original_deflated;
   std::vector<char> original_unfiltered;
+
+  //
+  std::map<uint32_t, size_t> invis_colors;
 
   //
   unsigned nth_generation;
@@ -648,7 +653,30 @@ void PngWolf::log_analysis() {
     printf(" ");
   }
 
-  printf("\noriginal filters:");
+  if (ihdr.color == 6 && ihdr.depth == 8) {
+    printf("\ninvisible colors:\n");
+    std::map<uint32_t, size_t>::iterator it;
+    uint32_t total = 0;
+
+    // TODO: htonl is probably not right here
+    for (it = invis_colors.begin(); it != invis_colors.end(); ++it) {
+      printf("  - %08X # %u times\n", htonl(it->first), it->second);
+      total += it->second;
+    }
+
+    bool skip = invis_colors.size() == 1
+      && invis_colors.begin()->first == 0x00000000;
+
+    printf("  # %u pixels (%0.2f%%) are fully transparent\n",
+      total, (double)total / ((double)ihdr.width * (double)ihdr.height));
+
+    if (invis_colors.size() > 0 && !skip)
+      printf("  # --normalize-alpha changes them into transparent black\n");
+  } else {
+    printf("\n");
+  }
+
+  printf("original filters:");
   log_genome(this->ge_original);
 
   printf("\n"
@@ -1121,13 +1149,41 @@ bool PngWolf::read_file() {
     original_filters.push_back((PngFilter)filter);
   }
 
+  // TODO: copy properly here
   original_unfiltered.resize(original_inflated.size());
-
   memcpy(&original_unfiltered[0],
     &original_inflated[0], original_inflated.size());
 
   unfilter_idat((unsigned char*)&original_unfiltered[0],
     ihdr.height, scanline_delta, scanline_width);
+
+  // Creates a histogram of the fully transparent pixels in the
+  // image. It is apparently common for graphics programs to
+  // keep the color values of fully transparent pixels around,
+  // but this is rarely desired and makes compression harder, so
+  // we tell users about that and offer to normalize the pixels.
+
+  // TODO: Now that it is modified, original_unfiltered is the
+  // wrong name for the attribute.
+
+  if (ihdr.color == 6 && ihdr.depth == 8) {
+    uint32_t pixel;
+    uint32_t zero = 0;
+    for (uint32_t row = 0; row < ihdr.height; ++row) {
+      for (uint32_t col = 1; col < scanline_width; col += 4) {
+        size_t pos = row * scanline_width + col;
+
+        if (original_unfiltered[pos + 3] != 0)
+          continue;
+
+        memcpy(&pixel, &original_unfiltered[pos], 4);
+        invis_colors[pixel]++;
+
+        if (normalize_alpha)
+          memcpy(&original_unfiltered[pos], &zero, 4);
+      }
+    }
+  }
 
   return false;
 
@@ -1299,6 +1355,7 @@ help(void) {
     "  --verbose-summary              More details in optimization summary         \n"
     "  --verbose-critter              More details when improvements are found     \n"
     "  --verbose                      Shorthand for all verbosity options          \n"
+    "  --normalize-alpha              For RGBA, make fully transparent pixels black\n"
     "  --info                         Just print out verbose analysis and exit     \n"
     "  --help                         Print this help page and exit                \n"
     " -----------------------------------------------------------------------------\n"
@@ -1337,6 +1394,7 @@ main(int argc, char *argv[]) {
   bool argExcludeOriginal = false;
   bool argExcludeHeuristic = false;
   bool argInfo = false;
+  bool argNormalizeAlpha = false;
   const char* argPng = NULL;
   const char* argOut = NULL;
   const char* argBestIdatTo = NULL;
@@ -1405,6 +1463,10 @@ main(int argc, char *argv[]) {
     } else if (strcmp("--info", s) == 0) {
       argInfo = true;
       argVerboseAnalysis = true;
+      continue;
+
+    } else if (strcmp("--normalize-alpha", s) == 0) {
+      argNormalizeAlpha = true;
       continue;
 
     }
@@ -1515,6 +1577,7 @@ main(int argc, char *argv[]) {
   wolf.szip_fast = arg7zipFastBytes;
   wolf.szip_pass = arg7zipPasses;
   wolf.szip_cycl = arg7zipCycles;
+  wolf.normalize_alpha = argNormalizeAlpha;
 
   // TODO: ...
   try {
