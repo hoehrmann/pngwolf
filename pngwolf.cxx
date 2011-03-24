@@ -50,6 +50,7 @@
 #include <limits.h>
 #include <math.h>
 #include <map>
+#include <bitset>
 
 #ifdef _MSC_VER
 #pragma warning(push, 4)
@@ -112,6 +113,9 @@ public:
   PngFilterGenome* ge_all_avg;
   PngFilterGenome* ge_all_paeth;
   PngFilterGenome* ge_heuristic;
+  PngFilterGenome* ge_experiment1;
+  PngFilterGenome* ge_experiment2;
+  PngFilterGenome* ge_experiment3;
   std::vector<PngFilterGenome*> best_genomes;
 
   // Command line options
@@ -128,6 +132,9 @@ public:
   bool exclude_singles;
   bool exclude_original;
   bool exclude_heuristic;
+  bool include_experiment1;
+  bool include_experiment2;
+  bool include_experiment3;
   bool normalize_alpha;
   int zlib_level;
   int zlib_windowBits;
@@ -194,6 +201,9 @@ public:
     ge_all_up(NULL),
     ge_all_paeth(NULL),
     ge_heuristic(NULL),
+    ge_experiment1(NULL),
+    ge_experiment2(NULL),
+    ge_experiment3(NULL),
     ge_original(NULL),
     done_deflating_at(0)
   {}
@@ -588,10 +598,12 @@ void PngWolf::log_summary() {
     log_genome(best_genomes.back());
     printf("\n");
     printf(""
-      "total time spent optimizing: %0.0f\n"
-      "number of genomes evaluated: %u\n"
-      "size of 7zip deflated data:  %u\n"
-      "size difference to original: %d\n",
+      "best zlib deflated idat size: %0.0f\n"
+      "total time spent optimizing:  %0.0f\n"
+      "number of genomes evaluated:  %u\n"
+      "size of 7zip deflated data:   %u\n"
+      "size difference to original:  %d\n",
+      best_genomes.back()->score(),
       difftime(time(NULL), program_begun_at),
       genomes_evaluated,
       best_deflated.size(),
@@ -680,25 +692,37 @@ void PngWolf::log_analysis() {
   log_genome(this->ge_original);
 
   printf("\n"
+    "zlib deflated idat size for original filter: %0.0f\n"
     "zlib deflated idat size for None:            %0.0f\n"
     "zlib deflated idat size for Sub:             %0.0f\n"
     "zlib deflated idat size for Up:              %0.0f\n"
     "zlib deflated idat size for Avg:             %0.0f\n"
     "zlib deflated idat size for Paeth:           %0.0f\n"
-    "zlib deflated idat size for original filter: %0.0f\n"
+    "zlib deflated idat size for experiment 1:    %0.0f\n"
+    "zlib deflated idat size for experiment 2:    %0.0f\n"
+    "zlib deflated idat size for experiment 3:    %0.0f\n"
     "zlib deflated idat size for basic heuristic: %0.0f\n"
     "basic heuristic filters:",
+    this->ge_original->score(),
     this->ge_all_none->score(),
     this->ge_all_sub->score(),
     this->ge_all_up->score(),
     this->ge_all_avg->score(),
     this->ge_all_paeth->score(),
-    this->ge_original->score(),
+    this->ge_experiment1->score(),
+    this->ge_experiment2->score(),
+    this->ge_experiment3->score(),
     this->ge_heuristic->score());
 
   log_genome(this->ge_heuristic);
-
+  printf("\nexperiment 1 filters:");
+  log_genome(this->ge_experiment1);
+  printf("\nexperiment 2 filters:");
+  log_genome(this->ge_experiment2);
+  printf("\nexperiment 3 filters:");
+  log_genome(this->ge_experiment3);
   printf("\n");
+
   fflush(stdout);
 }
 
@@ -781,6 +805,9 @@ void PngWolf::init_filters() {
   this->ge_all_paeth = (PngFilterGenome*)ge.clone();
   this->ge_original = (PngFilterGenome*)ge.clone();
   this->ge_heuristic = (PngFilterGenome*)ge.clone();
+  this->ge_experiment1 = (PngFilterGenome*)ge.clone();
+  this->ge_experiment2 = (PngFilterGenome*)ge.clone();
+  this->ge_experiment3 = (PngFilterGenome*)ge.clone();
 
   for (int i = 0; i < ge.size(); ++i) {
     ge_original->gene(i, original_filters[i]);
@@ -791,19 +818,17 @@ void PngWolf::init_filters() {
     ge_all_up->gene(i, Up);
   }
 
-  // TODO: figure out a good way to avoid creating the genomes
-  // using the same filter for all scanlines twice.
+  std::vector<char> singles[] = {
+    refilter(*ge_all_none),
+    refilter(*ge_all_sub),
+    refilter(*ge_all_up),
+    refilter(*ge_all_avg),
+    refilter(*ge_all_paeth)
+  };
 
-  std::pair<int, PngFilter> def(INT_MAX, None);
-  std::vector< std::pair<int, PngFilter> > diffs(ge.size(), def);
-
-  for (int type = 0; type < 5; ++type) {
-    PngFilterGenome genome(ge);
-
-    for (int i = 0; i < genome.size(); ++i)
-      genome.gene(i, (PngFilter)type);
-
-    std::vector<char> single = refilter(genome);
+  for (int row = 0; row < ge.size(); ++row) {
+    int best_sum = INT_MAX;
+    int best_flt = 0;
 
     // "The following simple heuristic has performed well in
     // early tests: compute the output scanline using all five
@@ -813,28 +838,116 @@ void PngWolf::init_filters() {
     // usually outperforms any single fixed filter choice." as 
     // per <http://www.w3.org/TR/PNG/#12Filter-selection>.
 
-    for (int i = 0; i < genome.size(); ++i) {
-      std::vector<char>::iterator begin =
-        single.begin() + (i + 0) * scanline_width + 1;
-      std::vector<char>::iterator endit =
-        single.begin() + (i + 1) * scanline_width;
+    // Note that I've found this to be incorrect, as far as
+    // typical RGB and RGBA images found on the web go, using
+    // None for all scanlines outperforms the heuristic in 57%
+    // of the cases. Even if you carefully check whether they
+    // should really be stored as indexed images, there is not
+    // much evidence to support "usually". A better heuristic
+    // would be applying the heuristic and None to all and use
+    // the combination that performs better.
+    for (int flt = 0; flt< 5; ++flt) {
+      std::vector<char>::iterator scanline =
+        singles[flt].begin() + row * scanline_width;
 
-      int sum = std::accumulate(begin, endit, 0, sum_abs);
+      int sum = std::accumulate(scanline + 1,
+        scanline + scanline_width, 0, sum_abs);
 
       // If, for this scanline, the current filter is better
       // then the previous best filter, we memorize this filter,
       // otherwise this filter can be disregarded for the line.
-
-      if (sum >= diffs[i].first)
+      if (sum >= best_sum)
         continue;
 
-      diffs[i].first = sum;
-      diffs[i].second = (PngFilter)type;
+      best_sum = sum;
+      best_flt = flt;
     }
+
+    ge_heuristic->gene(row, (PngFilter)best_flt);
   }
 
-  for (int i = 0; i < ge_heuristic->size(); ++i)
-    ge_heuristic->gene(i, diffs[i].second);
+  // As an experimental heuristic, this compresses each scanline
+  // individually and picks the filter that compresses the line
+  // best. This may be a useful clue for the others, but tests
+  // suggests this might interfere in cases where zlib is a poor
+  // estimator, tuning genomes too much for zlib instead of 7zip.
+  // Generally this should be expected to perform poorly for very
+  // small images. In the standard Alexa 1000 sample it performs
+  // better than the specification's heuristic in 73% of cases;
+  // files would be around 3% (median) and 4% (mean) smaller.
+  for (int row = 0; row < ge.size(); ++row) {
+    int best_sum = INT_MAX;
+    int best_flt = 0;
+
+    for (int flt = 0; flt < 5; ++flt) {
+      std::vector<char>::iterator scanline =
+        singles[flt].begin() + row * scanline_width;
+
+      std::vector<char> line(scanline, scanline + scanline_width);
+      int sum = deflate_zlib(line).size();
+
+      if (sum >= best_sum)
+        continue;
+
+      best_sum = sum;
+      best_flt = flt;
+    }
+
+    ge_experiment1->gene(row, (PngFilter)best_flt);
+  }
+
+  // unigram heuristic
+  for (int row = 0; row < ge.size(); ++row) {
+    size_t best_sum = INT_MAX;
+    int best_flt = 0;
+
+    for (int flt = 0; flt< 5; ++flt) {
+      std::bitset<65536> seen;
+      std::vector<char>::iterator it;
+      std::vector<char>::iterator scanline =
+        singles[flt].begin() + row * scanline_width;
+
+      for (it = scanline; it < scanline + scanline_width; ++it)
+        seen.set(uint8_t(*it));
+
+      size_t sum = seen.count();
+
+      if (sum >= best_sum)
+        continue;
+
+      best_sum = sum;
+      best_flt = flt;
+    }
+
+    ge_experiment2->gene(row, (PngFilter)best_flt);
+  }
+
+  // bigram heuristic
+  for (int row = 0; row < ge.size(); ++row) {
+    size_t best_sum = INT_MAX;
+    int best_flt = 0;
+
+    for (int flt = 0; flt< 5; ++flt) {
+      std::bitset<65536> seen;
+      std::vector<char>::iterator it;
+      std::vector<char>::iterator scanline =
+        singles[flt].begin() + row * scanline_width;
+
+      for (it = scanline + 1; it < scanline + scanline_width; ++it)
+        seen.set((uint8_t(*(it - 1)) << 8) | uint8_t(*it));
+
+      size_t sum = seen.count();
+
+      if (sum >= best_sum)
+        continue;
+
+      best_sum = sum;
+      best_flt = flt;
+    }
+
+    ge_experiment3->gene(row, (PngFilter)best_flt);
+  }
+
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -854,7 +967,7 @@ void PngWolf::run() {
 
   // TODO: for now this uses copies but there is no deallocator for
   // the originals, at some point I should figure out how to own the
-  // critters. Maybe the Wolf should have a second populations that
+  // critters. Maybe the Wolf should have a second population that
   // owns them, that way the default deallocator should handle them.
 
   if (!exclude_singles) {
@@ -870,6 +983,15 @@ void PngWolf::run() {
 
   if (!exclude_heuristic)
     pop.add(*this->ge_heuristic);
+
+  if (include_experiment1)
+    pop.add(*this->ge_experiment1);
+
+  if (include_experiment2)
+    pop.add(*this->ge_experiment2);
+
+  if (include_experiment3)
+    pop.add(*this->ge_experiment3);
 
   // If all standard genomes have been excluded a randomized one has
   // to be added so the population knows how to make more genomes.
@@ -916,6 +1038,8 @@ void PngWolf::run() {
   // scoping slash ownership is unclear. It would work only during
   // run() which is a bit non-intuitive, so TODO: maybe remove this.
   this->ga = &ga;
+
+  ga.crossover(PngFilterGenome::TwoPointCrossover);
 
   best_genomes.push_back((PngFilterGenome*)pop.best().clone());
 
@@ -1339,9 +1463,10 @@ help(void) {
     "  --exclude-singles              Exclude single-filter genomes from population\n"
     "  --exclude-original             Exclude the filters of the input image       \n"
     "  --exclude-heuristic            Exclude the heuristically generated filters  \n"
+    "  --include-experiments          Include experimental heuristic               \n"
     "  --population-size=<int>        Size of the population. Defaults to 19.      \n"
-    "  --max-time=<seconds>           Timeout. Default is >120< Use 0 to disable.  \n"
-    "  --max-stagnate-time=<seconds>  Give up after seconds of no improvement      \n"
+    "  --max-time=<seconds>           Timeout after seconds. (default: 0, disabled)\n"
+    "  --max-stagnate-time=<seconds>  Give up if no improvement is found (d: 5)    \n"
     "  --max-deflate=<megabytes>      Give up after deflating this many megabytes  \n"
     "  --max-evaluations=<int>        Give up after evaluating this many genomes   \n"
     "  --zlib-level=<int>             zlib estimator compression level (default: 5)\n"
@@ -1349,7 +1474,7 @@ help(void) {
     "  --zlib-window=<int>            zlib estimator window bits (default: 15)     \n"
     "  --zlib-memlevel=<int>          zlib estimator memory level (default: 8)     \n"
     "  --7zip-mfb=<int>               7zip fast bytes 3..258 (default: 258)        \n"
-    "  --7zip-mpass=<int>             7zip passes 0..15 (d: 5; > ~ slower, smaller)\n"
+    "  --7zip-mpass=<int>             7zip passes 0..15 (d: 2; > ~ slower, smaller)\n"
     "  --7zip-mmc=<int>               7zip match finder cycles (d: 258)            \n"
     "  --verbose-analysis             More details in initial image analysis       \n"
     "  --verbose-summary              More details in optimization summary         \n"
@@ -1393,14 +1518,17 @@ main(int argc, char *argv[]) {
   bool argExcludeSingles = false;
   bool argExcludeOriginal = false;
   bool argExcludeHeuristic = false;
+  bool argIncludeExperiment1 = false;
+  bool argIncludeExperiment2 = false;
+  bool argIncludeExperiment3 = false;
   bool argInfo = false;
   bool argNormalizeAlpha = false;
   const char* argPng = NULL;
   const char* argOut = NULL;
   const char* argBestIdatTo = NULL;
   const char* argOriginalIdatTo = NULL;
-  int argMaxTime = 120;
-  int argMaxStagnateTime = 0;
+  int argMaxTime = 0;
+  int argMaxStagnateTime = 5;
   int argMaxEvaluations = 0;
   int argMaxDeflate = 0;
   int argPopulationSize = 19;
@@ -1409,7 +1537,7 @@ main(int argc, char *argv[]) {
   int argZlibMemory = 8;
   int argZlibWindow = 15;
   int arg7zipFastBytes = 258;
-  int arg7zipPasses = 5;
+  int arg7zipPasses = 2;
   int arg7zipCycles = 258;
 
   bool argOkay = true;;
@@ -1467,6 +1595,12 @@ main(int argc, char *argv[]) {
 
     } else if (strcmp("--normalize-alpha", s) == 0) {
       argNormalizeAlpha = true;
+      continue;
+
+    } else if (strcmp("--include-experiments", s) == 0) {
+      argIncludeExperiment1 = true;
+      argIncludeExperiment2 = true;
+      argIncludeExperiment3 = true;
       continue;
 
     }
@@ -1563,6 +1697,9 @@ main(int argc, char *argv[]) {
   wolf.exclude_heuristic = argExcludeHeuristic;
   wolf.exclude_original = argExcludeOriginal;
   wolf.exclude_singles = argExcludeSingles;
+  wolf.include_experiment1 = argIncludeExperiment1;
+  wolf.include_experiment2 = argIncludeExperiment2;
+  wolf.include_experiment3 = argIncludeExperiment3;
   wolf.population_size = argPopulationSize;
   wolf.max_stagnate_time = argMaxStagnateTime;
   wolf.last_step_at = time(NULL);
