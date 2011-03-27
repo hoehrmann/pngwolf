@@ -116,7 +116,11 @@ public:
   PngFilterGenome* ge_experiment1;
   PngFilterGenome* ge_experiment2;
   PngFilterGenome* ge_experiment3;
+  PngFilterGenome* ge_experiment4;
   std::vector<PngFilterGenome*> best_genomes;
+
+  // ...
+  GAPopulation initial_pop;
 
   // Command line options
   unsigned max_stagnate_time;
@@ -132,9 +136,10 @@ public:
   bool exclude_singles;
   bool exclude_original;
   bool exclude_heuristic;
-  bool include_experiment1;
-  bool include_experiment2;
-  bool include_experiment3;
+  bool exclude_experiment1;
+  bool exclude_experiment2;
+  bool exclude_experiment3;
+  bool exclude_experiment4;
   bool normalize_alpha;
   int zlib_level;
   int zlib_windowBits;
@@ -204,6 +209,7 @@ public:
     ge_experiment1(NULL),
     ge_experiment2(NULL),
     ge_experiment3(NULL),
+    ge_experiment4(NULL),
     ge_original(NULL),
     done_deflating_at(0)
   {}
@@ -245,73 +251,76 @@ unsigned char paeth_predictor(unsigned char a, unsigned char b, unsigned char c)
 
 void filter_row_none(unsigned char* src, unsigned char* dst, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
-  while (xix < (row+1)*bytes)
-    dst[xix++] = src[xix];
+  memcpy(dst + xix, src + xix, bytes - 1);
 }
 
 void filter_row_sub(unsigned char* src, unsigned char* dst, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
   size_t aix = xix;
-  xix += pwidth;
-  while (xix < (row+1)*bytes)
-    dst[xix++] -= src[aix++];
+
+  for (; xix < row * bytes + 1 + pwidth; ++xix)
+    dst[xix] = src[xix];
+
+  for (; xix < (row+1)*bytes; ++xix, ++aix)
+    dst[xix] = src[xix] - src[aix];
 }
 
 void filter_row_up(unsigned char* src, unsigned char* dst, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
   size_t bix = xix - bytes;
-  if (row == 0)
+
+  if (row == 0) {
+    memcpy(dst + 1, src + 1, bytes - 1);
     return;
-  while (xix < (row+1)*bytes)
-    dst[xix++] -= src[bix++];
+  }
+
+  for (; xix < (row+1)*bytes; ++xix, ++bix)
+    dst[xix] = src[xix] - src[bix];
 }
 
 void filter_row_avg(unsigned char* src, unsigned char* dst, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
   size_t bix = xix - bytes;
-  size_t aix;
+  size_t aix = xix;
 
   if (row == 0) {
-    size_t aix = xix;
-    xix += pwidth;
-    while (xix < (row+1)*bytes)
-      dst[xix++] -= src[aix++] >> 1;
+    for (; xix < row * bytes + 1 + pwidth; ++xix)
+      dst[xix] = src[xix];
+
+    for (; xix < (row+1)*bytes; ++xix, ++aix)
+      dst[xix] = src[xix] - (src[aix] >> 1);
+
     return;
   }
 
-  aix = xix;
-  for (; pwidth > 0; --pwidth)
-    dst[xix++] -= src[bix++] >> 1;
+  for (; xix < row * bytes + 1 + pwidth; ++xix, ++bix)
+    dst[xix] = src[xix] - (src[bix] >> 1);
   
-  while (xix < (row+1)*bytes)
-    dst[xix++] -= (src[aix++] + src[bix++]) >> 1;
+  for (; xix < (row+1)*bytes; ++xix, ++aix, ++bix)
+    dst[xix] = src[xix] - ((src[aix] + src[bix]) >> 1);
 }
 
 void filter_row_paeth(unsigned char* src, unsigned char* dst, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
+  size_t aix = xix;
   size_t bix = xix - bytes;
-  size_t aix, cix;
+  size_t cix = xix - bytes;
 
   if (row == 0) {
-    size_t aix = xix;
-    xix += pwidth;
-    while (xix < (row+1)*bytes)
-      dst[xix++] -= paeth_predictor(src[aix++], 0 , 0);
+    for (; xix < row * bytes + 1 + pwidth; ++xix)
+      dst[xix] = src[xix];
+
+    for (; xix < (row+1)*bytes; ++xix, ++aix)
+      dst[xix] = src[xix] - paeth_predictor(src[aix], 0 , 0);
+
     return;
   }
 
-  aix = xix;
-  cix = aix - bytes;
-
-  for (; pwidth > 0; --pwidth)
-    dst[xix++] -= paeth_predictor(0, src[bix++] , 0);
+  for (; pwidth > 0; --pwidth, ++xix, ++bix)
+    dst[xix] = src[xix] - paeth_predictor(0, src[bix] , 0);
   
-  while (xix < (row+1)*bytes)
-    dst[xix++] -= paeth_predictor(src[aix++], src[bix++], src[cix++]);
-}
-
-void unfilter_row_none(unsigned char* idat, size_t row, size_t bytes) {
-  return;
+  for (; xix < (row+1)*bytes; ++xix, ++aix, ++bix, ++cix)
+    dst[xix] = src[xix] - paeth_predictor(src[aix], src[bix], src[cix]);
 }
 
 void unfilter_row_sub(unsigned char* idat, size_t row, size_t pwidth, size_t bytes) {
@@ -421,6 +430,7 @@ void filter_idat(unsigned char* src, unsigned char* dst, PngFilterGenome& filter
     default:
       assert(!"bad filter type");
     }
+    // TODO: check that src uses the `none` filter
     dst[row*bytes] = (unsigned char)filter.gene(row);
   }
 }
@@ -455,7 +465,7 @@ GAAlleleSet<PngFilter>::allele() const {
   return (PngFilter)GARandomInt(lower(), upper());
 }
 
-std::vector<char> deflate_7zip(std::vector<char>& inflated, unsigned pass, unsigned fast, unsigned cycl) {
+std::vector<char> deflate_7zip(std::vector<char>& inflated, unsigned algo, unsigned pass, unsigned fast, unsigned cycl) {
 
   NCompress::NZlib::CEncoder c;
   PROPID algoProp = NCoderPropID::kAlgorithm;
@@ -473,7 +483,7 @@ std::vector<char> deflate_7zip(std::vector<char>& inflated, unsigned pass, unsig
   NCompress::NDeflate::NEncoder::CCOMCoder* d = 
     c.DeflateEncoderSpec;
 
-  v.ulVal = 1;
+  v.ulVal = algo;
   if (d->SetCoderProperties(&algoProp, &v, 1) != S_OK) {
   }
 
@@ -545,17 +555,13 @@ std::vector<char> deflate_zlib(std::vector<char>& inflated) {
 }
 
 std::vector<char> PngWolf::refilter(PngFilterGenome& ge) {
-  std::vector<char> copy(original_unfiltered.size());
-
-  // TODO: this should be made redundant, but the filters
-  // need to be modified so they copy all the data first.
-  memcpy(&copy[0], &original_unfiltered[0], copy.size());
+  std::vector<char> refiltered(original_unfiltered.size());
 
   filter_idat((unsigned char*)&original_unfiltered[0],
-    (unsigned char*)&copy[0], ge,
+    (unsigned char*)&refiltered[0], ge,
     scanline_delta, scanline_width);
 
-  return copy;
+  return refiltered;
 }
 
 float Evaluator(GAGenome& genome) {
@@ -688,21 +694,19 @@ void PngWolf::log_analysis() {
     printf("\n");
   }
 
-  printf("original filters:");
-  log_genome(this->ge_original);
-
-  printf("\n"
-    "zlib deflated idat size for original filter: %0.0f\n"
-    "zlib deflated idat size for None:            %0.0f\n"
-    "zlib deflated idat size for Sub:             %0.0f\n"
-    "zlib deflated idat size for Up:              %0.0f\n"
-    "zlib deflated idat size for Avg:             %0.0f\n"
-    "zlib deflated idat size for Paeth:           %0.0f\n"
-    "zlib deflated idat size for experiment 1:    %0.0f\n"
-    "zlib deflated idat size for experiment 2:    %0.0f\n"
-    "zlib deflated idat size for experiment 3:    %0.0f\n"
-    "zlib deflated idat size for basic heuristic: %0.0f\n"
-    "basic heuristic filters:",
+  printf(""
+    "zlib deflated idat sizes:\n"
+    "  original filter:  %0.0f\n"
+    "  none:             %0.0f\n"
+    "  sub:              %0.0f\n"
+    "  up:               %0.0f\n"
+    "  avg:              %0.0f\n"
+    "  paeth:            %0.0f\n"
+    "  deflate scanline: %0.0f\n"
+    "  distinct bytes:   %0.0f\n"
+    "  distinct bigrams: %0.0f\n"
+    "  incremental:      %0.0f\n"
+    "  basic heuristic:  %0.0f\n",
     this->ge_original->score(),
     this->ge_all_none->score(),
     this->ge_all_sub->score(),
@@ -712,15 +716,21 @@ void PngWolf::log_analysis() {
     this->ge_experiment1->score(),
     this->ge_experiment2->score(),
     this->ge_experiment3->score(),
+    this->ge_experiment4->score(),
     this->ge_heuristic->score());
 
+  printf("original filters:");
+  log_genome(this->ge_original);
+  printf("\nbasic heuristic filters:");
   log_genome(this->ge_heuristic);
-  printf("\nexperiment 1 filters:");
+  printf("\ndeflate scanline filters:");
   log_genome(this->ge_experiment1);
-  printf("\nexperiment 2 filters:");
+  printf("\ndistinct bytes filters:");
   log_genome(this->ge_experiment2);
-  printf("\nexperiment 3 filters:");
+  printf("\ndistinct bigrams filters:");
   log_genome(this->ge_experiment3);
+  printf("\nincremental filters:");
+  log_genome(this->ge_experiment4);
   printf("\n");
 
   fflush(stdout);
@@ -732,10 +742,10 @@ void PngWolf::log_critter(PngFilterGenome* curr_best) {
   
   if (!this->verbose_critters) {
     printf(""
-      "- zlib deflated idat size: %7u # %+5d bytes %+4.0f seconds since previous\n",
+      "- zlib deflated idat size: %7u # %+5d bytes %+4.0f seconds\n",
       unsigned(curr_best->score()),
-      signed(curr_best->score() - prev_best->score()),
-      difftime(time(NULL), last_improvement_at));
+      signed(curr_best->score() - initial_pop.best().score()),
+      difftime(time(NULL), program_begun_at));
     return;
   }
 
@@ -808,6 +818,7 @@ void PngWolf::init_filters() {
   this->ge_experiment1 = (PngFilterGenome*)ge.clone();
   this->ge_experiment2 = (PngFilterGenome*)ge.clone();
   this->ge_experiment3 = (PngFilterGenome*)ge.clone();
+  this->ge_experiment4 = (PngFilterGenome*)ge.clone();
 
   for (int i = 0; i < ge.size(); ++i) {
     ge_original->gene(i, original_filters[i]);
@@ -948,13 +959,61 @@ void PngWolf::init_filters() {
     ge_experiment3->gene(row, (PngFilter)best_flt);
   }
 
-}
+  z_stream strm;
+  strm.zalloc = Z_NULL;
+  strm.zfree = Z_NULL;
+  strm.opaque = Z_NULL;
 
-////////////////////////////////////////////////////////////////////
-// Experiment
-////////////////////////////////////////////////////////////////////
-void PngWolf::run() {
-  GAPopulation pop;
+  if (deflateInit2(&strm, wolf.zlib_level, Z_DEFLATED,
+    wolf.zlib_windowBits, wolf.zlib_memLevel,
+    wolf.zlib_strategy) != Z_OK) {
+    abort();
+  }
+
+  size_t max = deflateBound(&strm, original_inflated.size());
+  std::vector<char> strm_deflated(max);
+  strm.next_out = (Bytef*)&strm_deflated[0];
+  strm.avail_out = max;
+
+  for (int row = 0; row < ge.size(); ++row) {
+    size_t pos = row * scanline_width;
+    size_t best_sum = INT_MAX;
+    int best_flt = 0;
+
+    for (int flt = 0; flt< 5; ++flt) {
+      z_stream here;
+
+      if (deflateCopy(&here, &strm) != Z_OK) {
+      }
+
+      here.next_in = (Bytef*)&singles[flt][pos];
+      here.avail_in = scanline_width;
+
+      int status = deflate(&here, Z_FINISH);
+      if (status != Z_STREAM_END && status != Z_OK) {
+      }
+
+      size_t sum = max - here.avail_out;
+
+      deflateEnd(&here);
+
+      if (sum >= best_sum)
+        continue;
+
+      best_sum = sum;
+      best_flt = flt;
+    }
+
+    ge_experiment4->gene(row, (PngFilter)best_flt);
+    strm.next_in = (Bytef*)&singles[best_flt][pos];
+    strm.avail_in = scanline_width;
+
+    if (deflate(&strm, Z_NO_FLUSH) != Z_OK) {
+    }
+
+  }
+
+  deflateEnd(&strm);
 
   // As initial population this uses, by default, the filters in the
   // original image, the filters derived by the heuristic proposed by
@@ -970,35 +1029,50 @@ void PngWolf::run() {
   // critters. Maybe the Wolf should have a second population that
   // owns them, that way the default deallocator should handle them.
 
+  ge_all_none->evaluate();
+  ge_all_sub->evaluate();
+  ge_all_up->evaluate();
+  ge_all_avg->evaluate();
+  ge_all_paeth->evaluate();
+  ge_original->evaluate();
+  ge_heuristic->evaluate();
+  ge_experiment1->evaluate();
+  ge_experiment2->evaluate();
+  ge_experiment3->evaluate();
+  ge_experiment4->evaluate();
+
   if (!exclude_singles) {
-    pop.add(*this->ge_all_none);
-    pop.add(*this->ge_all_sub);
-    pop.add(*this->ge_all_up);
-    pop.add(*this->ge_all_avg);
-    pop.add(*this->ge_all_paeth);
+    initial_pop.add(*this->ge_all_none);
+    initial_pop.add(*this->ge_all_sub);
+    initial_pop.add(*this->ge_all_up);
+    initial_pop.add(*this->ge_all_avg);
+    initial_pop.add(*this->ge_all_paeth);
   }
 
   if (!exclude_original)
-    pop.add(*this->ge_original);
+    initial_pop.add(*this->ge_original);
 
   if (!exclude_heuristic)
-    pop.add(*this->ge_heuristic);
+    initial_pop.add(*this->ge_heuristic);
 
-  if (include_experiment1)
-    pop.add(*this->ge_experiment1);
+  if (!exclude_experiment1)
+    initial_pop.add(*this->ge_experiment1);
 
-  if (include_experiment2)
-    pop.add(*this->ge_experiment2);
+  if (!exclude_experiment2)
+    initial_pop.add(*this->ge_experiment2);
 
-  if (include_experiment3)
-    pop.add(*this->ge_experiment3);
+  if (!exclude_experiment3)
+    initial_pop.add(*this->ge_experiment3);
+
+  if (!exclude_experiment4)
+    initial_pop.add(*this->ge_experiment4);
 
   // If all standard genomes have been excluded a randomized one has
   // to be added so the population knows how to make more genomes.
-  if (pop.size() == 0) {
+  if (initial_pop.size() == 0) {
     PngFilterGenome clone(*ge_original);
     clone.initialize();
-    pop.add(clone);
+    initial_pop.add(clone);
   }
 
   // This adds random critters to the initial population. Very low
@@ -1008,17 +1082,23 @@ void PngWolf::run() {
   // value here works okay-ish for reasonably sized images. There
   // is the option to make this configurable, but there is not much
   // evidence the value makes that much of a difference.
-  pop.size(population_size);
+  initial_pop.size(population_size);
 
   // This defines ordering by score (idat size in our case). Lower
   // idat size is better than higher idat size, setting accordingly.
-  pop.order(GAPopulation::LOW_IS_BEST);
+  initial_pop.order(GAPopulation::LOW_IS_BEST);
+}
+
+////////////////////////////////////////////////////////////////////
+// Experiment
+////////////////////////////////////////////////////////////////////
+void PngWolf::run() {
 
   // With what few samples I have used in testing, GAIncrementalGA
   // works very well with the other options I've used, it finds im-
   // provements fairly reliably while other Algorithms have trouble
   // to find improvements after a certain number of generations.
-  GAIncrementalGA ga(pop);
+  GAIncrementalGA ga(initial_pop);
 
   // There is no particular reason to use the tournament selector,
   // but the general concept seems sound for our purposes here, and
@@ -1041,7 +1121,8 @@ void PngWolf::run() {
 
   ga.crossover(PngFilterGenome::TwoPointCrossover);
 
-  best_genomes.push_back((PngFilterGenome*)pop.best().clone());
+  best_genomes.push_back((PngFilterGenome*)
+    ga.population().best().clone());
 
   printf("---\n");
 
@@ -1094,7 +1175,23 @@ after_while:
 void PngWolf::recompress() {
   best_inflated = refilter(*best_genomes.back());
   best_deflated = deflate_7zip(best_inflated,
-    szip_pass, szip_fast, szip_cycl);
+    1, szip_pass, szip_fast, szip_cycl);
+
+  // In my test sample in 1.66% of cases, using a high zlib level,
+  // zlib is able to produce smaller output than 7-Zip. So for the
+  // case where users do choose a high setting for zlib, reward
+  // them by using zlib instead to recompress. Since zlib is fast,
+  // this recompression should not be much of a performance hit.
+
+  // TODO: This should be noted in the verbose output, otherwise
+  // this would make 7zip appear better than it is. In the longer
+  // term perhaps the output should simply say what estimator and
+  // what compressor was used and give the respective sizes.
+
+  if (best_deflated.size() > best_genomes.back()->score()) {
+    best_deflated = deflate_zlib(best_inflated);
+  }
+
   done_deflating_at = time(NULL);
 }
 
@@ -1463,7 +1560,7 @@ help(void) {
     "  --exclude-singles              Exclude single-filter genomes from population\n"
     "  --exclude-original             Exclude the filters of the input image       \n"
     "  --exclude-heuristic            Exclude the heuristically generated filters  \n"
-    "  --include-experiments          Include experimental heuristic               \n"
+    "  --exclude-experiments          Exclude experimental heuristics              \n"
     "  --population-size=<int>        Size of the population. Defaults to 19.      \n"
     "  --max-time=<seconds>           Timeout after seconds. (default: 0, disabled)\n"
     "  --max-stagnate-time=<seconds>  Give up if no improvement is found (d: 5)    \n"
@@ -1518,9 +1615,10 @@ main(int argc, char *argv[]) {
   bool argExcludeSingles = false;
   bool argExcludeOriginal = false;
   bool argExcludeHeuristic = false;
-  bool argIncludeExperiment1 = false;
-  bool argIncludeExperiment2 = false;
-  bool argIncludeExperiment3 = false;
+  bool argExcludeExperiment1 = false;
+  bool argExcludeExperiment2 = false;
+  bool argExcludeExperiment3 = false;
+  bool argExcludeExperiment4 = false;
   bool argInfo = false;
   bool argNormalizeAlpha = false;
   const char* argPng = NULL;
@@ -1534,7 +1632,7 @@ main(int argc, char *argv[]) {
   int argPopulationSize = 19;
   int argZlibLevel = 5;
   int argZlibStrategy = 0;
-  int argZlibMemory = 8;
+  int argZlibMemlevel = 8;
   int argZlibWindow = 15;
   int arg7zipFastBytes = 258;
   int arg7zipPasses = 2;
@@ -1597,10 +1695,11 @@ main(int argc, char *argv[]) {
       argNormalizeAlpha = true;
       continue;
 
-    } else if (strcmp("--include-experiments", s) == 0) {
-      argIncludeExperiment1 = true;
-      argIncludeExperiment2 = true;
-      argIncludeExperiment3 = true;
+    } else if (strcmp("--exclude-experiments", s) == 0) {
+      argExcludeExperiment1 = true;
+      argExcludeExperiment2 = true;
+      argExcludeExperiment3 = true;
+      argExcludeExperiment4 = true;
       continue;
 
     }
@@ -1647,10 +1746,10 @@ main(int argc, char *argv[]) {
       argOkay &= argZlibLevel >= 0;
       argOkay &= argZlibLevel <= 9;
 
-    } else if (strncmp("--zlib-memory", s, nlen) == 0) {
-      argZlibMemory = atoi(value);
-      argOkay &= argZlibMemory >= 1;
-      argOkay &= argZlibMemory <= 9;
+    } else if (strncmp("--zlib-memlevel", s, nlen) == 0) {
+      argZlibMemlevel = atoi(value);
+      argOkay &= argZlibMemlevel >= 1;
+      argOkay &= argZlibMemlevel <= 9;
 
     } else if (strncmp("--zlib-window", s, nlen) == 0) {
       argZlibWindow = atoi(value);
@@ -1697,9 +1796,10 @@ main(int argc, char *argv[]) {
   wolf.exclude_heuristic = argExcludeHeuristic;
   wolf.exclude_original = argExcludeOriginal;
   wolf.exclude_singles = argExcludeSingles;
-  wolf.include_experiment1 = argIncludeExperiment1;
-  wolf.include_experiment2 = argIncludeExperiment2;
-  wolf.include_experiment3 = argIncludeExperiment3;
+  wolf.exclude_experiment1 = argExcludeExperiment1;
+  wolf.exclude_experiment2 = argExcludeExperiment2;
+  wolf.exclude_experiment3 = argExcludeExperiment3;
+  wolf.exclude_experiment4 = argExcludeExperiment4;
   wolf.population_size = argPopulationSize;
   wolf.max_stagnate_time = argMaxStagnateTime;
   wolf.last_step_at = time(NULL);
@@ -1708,7 +1808,7 @@ main(int argc, char *argv[]) {
   wolf.max_time = argMaxTime;
   wolf.out_path = argOut;
   wolf.zlib_level = argZlibLevel;
-  wolf.zlib_memLevel = argZlibMemory;
+  wolf.zlib_memLevel = argZlibMemlevel;
   wolf.zlib_strategy = argZlibStrategy;
   wolf.zlib_windowBits = argZlibWindow;
   wolf.szip_fast = arg7zipFastBytes;
