@@ -90,6 +90,11 @@ struct IhdrChunk {
 
 typedef GA1DArrayAlleleGenome<PngFilter> PngFilterGenome;
 
+class Deflater {
+public:
+  virtual std::vector<char> deflate(const std::vector<char>&) = 0;
+};
+
 class PngWolf {
 public:
   // IHDR data
@@ -106,17 +111,8 @@ public:
   std::vector<PngFilter> original_filters;
 
   // Filters; TODO: who owns them?
-  PngFilterGenome* ge_original;
-  PngFilterGenome* ge_all_none;
-  PngFilterGenome* ge_all_sub;
-  PngFilterGenome* ge_all_up;
-  PngFilterGenome* ge_all_avg;
-  PngFilterGenome* ge_all_paeth;
-  PngFilterGenome* ge_heuristic;
-  PngFilterGenome* ge_experiment1;
-  PngFilterGenome* ge_experiment2;
-  PngFilterGenome* ge_experiment3;
-  PngFilterGenome* ge_experiment4;
+  std::map<std::string, PngFilterGenome*> genomes;
+
   std::vector<PngFilterGenome*> best_genomes;
 
   // ...
@@ -132,7 +128,7 @@ public:
   const char* out_path;
   bool verbose_analysis;
   bool verbose_summary;
-  bool verbose_critters;
+  bool verbose_genomes;
   bool exclude_singles;
   bool exclude_original;
   bool exclude_heuristic;
@@ -141,6 +137,9 @@ public:
   bool exclude_experiment3;
   bool exclude_experiment4;
   bool normalize_alpha;
+  bool even_if_bigger;
+  bool auto_mpass;
+  bool bigger_is_better;
   int zlib_level;
   int zlib_windowBits;
   int zlib_memLevel;
@@ -148,6 +147,10 @@ public:
   int szip_pass;
   int szip_fast;
   int szip_cycl;
+
+  //
+  Deflater* deflate_fast;
+  Deflater* deflate_good;
 
   // User input
   bool should_abort;
@@ -163,6 +166,9 @@ public:
   std::vector<char> original_inflated;
   std::vector<char> original_deflated;
   std::vector<char> original_unfiltered;
+
+  // 
+  std::map<PngFilter, std::vector<char>> flt_singles;
 
   //
   std::map<uint32_t, size_t> invis_colors;
@@ -193,31 +199,135 @@ public:
   void init_filters();
   void run();
   void recompress();
-  std::vector<char> refilter(PngFilterGenome& ge);
+  std::vector<char> refilter(const PngFilterGenome& ge);
 
   // Constructor
   PngWolf() :
     should_abort(false),
     nth_generation(0),
     genomes_evaluated(0),
-    ge_all_none(NULL),
-    ge_all_avg(NULL),
-    ge_all_sub(NULL),
-    ge_all_up(NULL),
-    ge_all_paeth(NULL),
-    ge_heuristic(NULL),
-    ge_experiment1(NULL),
-    ge_experiment2(NULL),
-    ge_experiment3(NULL),
-    ge_experiment4(NULL),
-    ge_original(NULL),
-    done_deflating_at(0)
+    done_deflating_at(0),
+    deflate_fast(NULL),
+    deflate_good(NULL)
   {}
 
   ~PngWolf() {
-    // TODO: This should probably delete the genomes.
+    // TODO: This should probably delete the genomes, both
+    // the ge_ ones and the ones in the best_genomes vector
   }
 
+};
+
+struct DeflateZlib : public Deflater {
+public:
+  std::vector<char> deflate(const std::vector<char>& inflated) {
+
+    if (deflateReset(&strm) != Z_OK) {
+      // TODO: ...
+      abort();
+    }
+
+    strm.next_in = (Bytef*)&inflated[0];
+    strm.avail_in = inflated.size();
+
+    size_t max = deflateBound(&strm, inflated.size());
+    std::vector<char> new_deflated(max);
+
+    strm.next_out = (Bytef*)&new_deflated[0];
+    strm.avail_out = max;
+
+    // TODO: aborting here probably leaks memory
+    if (::deflate(&strm, Z_FINISH) != Z_STREAM_END)
+      abort();
+
+    new_deflated.resize(max - strm.avail_out);
+
+    return new_deflated;
+  }
+
+  DeflateZlib(int level, int windowBits, int memLevel, int strategy) {
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+
+    if (deflateInit2(&strm, level, Z_DEFLATED,
+      windowBits, memLevel, strategy) != Z_OK) {
+        // TODO:
+        abort();
+    }
+  }
+
+  z_stream strm;
+};
+
+struct Deflate7zip : public Deflater {
+public:
+  std::vector<char> deflate(const std::vector<char>& inflated) {
+
+    NCompress::NZlib::CEncoder c;
+    PROPID algoProp = NCoderPropID::kAlgorithm;
+    PROPID passProp = NCoderPropID::kNumPasses;
+    PROPID fastProp = NCoderPropID::kNumFastBytes;
+    PROPID cyclProp = NCoderPropID::kMatchFinderCycles;
+
+    PROPVARIANT v;
+    v.vt = VT_UI4;
+
+    // TODO: figure out what to do with errors here
+
+    c.Create();
+
+    NCompress::NDeflate::NEncoder::CCOMCoder* d = 
+      c.DeflateEncoderSpec;
+
+    v.ulVal = szip_algo;
+    if (d->SetCoderProperties(&algoProp, &v, 1) != S_OK) {
+    }
+
+    v.ulVal = szip_pass;
+    if (d->SetCoderProperties(&passProp, &v, 1) != S_OK) {
+    }
+
+    v.ulVal = szip_fast;
+    if (d->SetCoderProperties(&fastProp, &v, 1) != S_OK) {
+    }
+
+    v.ulVal = szip_cycl;
+    if (d->SetCoderProperties(&cyclProp, &v, 1) != S_OK) {
+    }
+
+    CBufInStream* in_buf = new CBufInStream;
+
+    // TODO: find a way to use a a fixed buffer since we know
+    // the maximum size for it and don't use more than one. It
+    // might also be a good idea to keep the other objects for
+    // all the passes through this to avoid re-allocations and
+    // the possible failures that might go along with them.
+    CDynBufSeqOutStream* out_buf = new CDynBufSeqOutStream;
+    in_buf->Init((const Byte*)&inflated[0], inflated.size());
+    CMyComPtr<ISequentialInStream> in(in_buf);
+    CMyComPtr<ISequentialOutStream> out(out_buf);
+
+    if (c.Code(in, out, NULL, NULL, NULL) != S_OK) {
+    }
+
+    std::vector<char> deflated(out_buf->GetSize());
+    memcpy(&deflated[0], out_buf->GetBuffer(), deflated.size());
+
+    return deflated;
+  }
+
+  Deflate7zip(int pass, int fast, int cycl) :
+    szip_pass(pass),
+    szip_fast(fast),
+    szip_cycl(cycl),
+    szip_algo(1) {
+  }
+
+  int szip_pass;
+  int szip_fast;
+  int szip_cycl;
+  int szip_algo;
 };
 
 static const char PNG_MAGIC[] = "\x89\x50\x4E\x47\x0D\x0A\x1A\x0A";
@@ -257,24 +367,26 @@ void filter_row_none(unsigned char* src, unsigned char* dst, size_t row, size_t 
 void filter_row_sub(unsigned char* src, unsigned char* dst, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
   size_t aix = xix;
+  size_t end = (row+1)*bytes;
 
   for (; xix < row * bytes + 1 + pwidth; ++xix)
     dst[xix] = src[xix];
 
-  for (; xix < (row+1)*bytes; ++xix, ++aix)
+  for (; xix < end; ++xix, ++aix)
     dst[xix] = src[xix] - src[aix];
 }
 
 void filter_row_up(unsigned char* src, unsigned char* dst, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
   size_t bix = xix - bytes;
+  size_t end = (row+1)*bytes;
 
   if (row == 0) {
     memcpy(dst + 1, src + 1, bytes - 1);
     return;
   }
 
-  for (; xix < (row+1)*bytes; ++xix, ++bix)
+  for (; xix < end; ++xix, ++bix)
     dst[xix] = src[xix] - src[bix];
 }
 
@@ -282,12 +394,13 @@ void filter_row_avg(unsigned char* src, unsigned char* dst, size_t row, size_t p
   size_t xix = row * bytes + 1;
   size_t bix = xix - bytes;
   size_t aix = xix;
+  size_t end = (row+1)*bytes;
 
   if (row == 0) {
     for (; xix < row * bytes + 1 + pwidth; ++xix)
       dst[xix] = src[xix];
 
-    for (; xix < (row+1)*bytes; ++xix, ++aix)
+    for (; xix < end; ++xix, ++aix)
       dst[xix] = src[xix] - (src[aix] >> 1);
 
     return;
@@ -296,7 +409,7 @@ void filter_row_avg(unsigned char* src, unsigned char* dst, size_t row, size_t p
   for (; xix < row * bytes + 1 + pwidth; ++xix, ++bix)
     dst[xix] = src[xix] - (src[bix] >> 1);
   
-  for (; xix < (row+1)*bytes; ++xix, ++aix, ++bix)
+  for (; xix < end; ++xix, ++aix, ++bix)
     dst[xix] = src[xix] - ((src[aix] + src[bix]) >> 1);
 }
 
@@ -305,50 +418,57 @@ void filter_row_paeth(unsigned char* src, unsigned char* dst, size_t row, size_t
   size_t aix = xix;
   size_t bix = xix - bytes;
   size_t cix = xix - bytes;
+  size_t end = (row+1)*bytes;
 
   if (row == 0) {
     for (; xix < row * bytes + 1 + pwidth; ++xix)
       dst[xix] = src[xix];
 
-    for (; xix < (row+1)*bytes; ++xix, ++aix)
+    for (; xix < end; ++xix, ++aix)
       dst[xix] = src[xix] - paeth_predictor(src[aix], 0 , 0);
 
     return;
   }
 
+  // TODO: this should not change pwidth
   for (; pwidth > 0; --pwidth, ++xix, ++bix)
     dst[xix] = src[xix] - paeth_predictor(0, src[bix] , 0);
   
-  for (; xix < (row+1)*bytes; ++xix, ++aix, ++bix, ++cix)
+  for (; xix < end; ++xix, ++aix, ++bix, ++cix)
     dst[xix] = src[xix] - paeth_predictor(src[aix], src[bix], src[cix]);
 }
 
 void unfilter_row_sub(unsigned char* idat, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
   size_t aix = xix;
+  size_t end = (row+1)*bytes;
+
   xix += pwidth;
-  while (xix < (row+1)*bytes)
+  while (xix < end)
     idat[xix++] += idat[aix++];
 }
 
 void unfilter_row_up(unsigned char* idat, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
   size_t bix = xix - bytes;
+  size_t end = (row+1)*bytes;
+
   if (row == 0)
     return;
-  while (xix < (row+1)*bytes)
+  while (xix < end)
     idat[xix++] += idat[bix++];
 }
 
 void unfilter_row_avg(unsigned char* idat, size_t row, size_t pwidth, size_t bytes) {
   size_t xix = row * bytes + 1;
   size_t bix = xix - bytes;
+  size_t end = (row+1)*bytes;
   size_t aix;
 
   if (row == 0) {
     size_t aix = xix;
     xix += pwidth;
-    while (xix < (row+1)*bytes)
+    while (xix < end)
       idat[xix++] += idat[aix++] >> 1;
     return;
   }
@@ -357,7 +477,7 @@ void unfilter_row_avg(unsigned char* idat, size_t row, size_t pwidth, size_t byt
   for (; pwidth > 0; --pwidth)
     idat[xix++] += idat[bix++] >> 1;
   
-  while (xix < (row+1)*bytes)
+  while (xix < end)
     idat[xix++] += (idat[aix++] + idat[bix++]) >> 1;
 }
 
@@ -365,11 +485,12 @@ void unfilter_row_paeth(unsigned char* idat, size_t row, size_t pwidth, size_t b
   size_t xix = row * bytes + 1;
   size_t bix = xix - bytes;
   size_t aix, cix;
+  size_t end = (row+1)*bytes;
 
   if (row == 0) {
     size_t aix = xix;
     xix += pwidth;
-    while (xix < (row+1)*bytes)
+    while (xix < end)
       idat[xix++] += paeth_predictor(idat[aix++], 0 , 0);
     return;
   }
@@ -380,7 +501,7 @@ void unfilter_row_paeth(unsigned char* idat, size_t row, size_t pwidth, size_t b
   for (; pwidth > 0; --pwidth)
     idat[xix++] += paeth_predictor(0, idat[bix++] , 0);
   
-  while (xix < (row+1)*bytes)
+  while (xix < end)
     idat[xix++] += paeth_predictor(idat[aix++], idat[bix++] , idat[cix++]);
 }
 
@@ -409,7 +530,7 @@ void unfilter_idat(unsigned char* idat, size_t rows, size_t pwidth, size_t bytes
   }
 }
 
-void filter_idat(unsigned char* src, unsigned char* dst, PngFilterGenome& filter, size_t pwidth, size_t bytes) {
+void filter_idat(unsigned char* src, unsigned char* dst, const PngFilterGenome& filter, size_t pwidth, size_t bytes) {
   for (int row = 0; row < filter.size(); ++row) {
     switch(filter.gene(row)) {
     case 0:
@@ -465,96 +586,48 @@ GAAlleleSet<PngFilter>::allele() const {
   return (PngFilter)GARandomInt(lower(), upper());
 }
 
-std::vector<char> deflate_7zip(std::vector<char>& inflated, unsigned algo, unsigned pass, unsigned fast, unsigned cycl) {
-
-  NCompress::NZlib::CEncoder c;
-  PROPID algoProp = NCoderPropID::kAlgorithm;
-  PROPID passProp = NCoderPropID::kNumPasses;
-  PROPID fastProp = NCoderPropID::kNumFastBytes;
-  PROPID cyclProp = NCoderPropID::kMatchFinderCycles;
-
-  PROPVARIANT v;
-  v.vt = VT_UI4;
-
-  // TODO: figure out what to do with errors here
-
-  c.Create();
-
-  NCompress::NDeflate::NEncoder::CCOMCoder* d = 
-    c.DeflateEncoderSpec;
-
-  v.ulVal = algo;
-  if (d->SetCoderProperties(&algoProp, &v, 1) != S_OK) {
-  }
-
-  v.ulVal = pass;
-  if (d->SetCoderProperties(&passProp, &v, 1) != S_OK) {
-  }
-
-  v.ulVal = fast;
-  if (d->SetCoderProperties(&fastProp, &v, 1) != S_OK) {
-  }
-
-  v.ulVal = cycl;
-  if (d->SetCoderProperties(&cyclProp, &v, 1) != S_OK) {
-  }
-
-  CBufInStream* in_buf = new CBufInStream;
-
-  // TODO: find a way to use a a fixed buffer since we know
-  // the maximum size for it and don't use more than one. It
-  // might also be a good idea to keep the other objects for
-  // all the passes through this to avoid re-allocations and
-  // the possible failures that might go along with them.
-  CDynBufSeqOutStream* out_buf = new CDynBufSeqOutStream;
-  in_buf->Init((const Byte*)&inflated[0], inflated.size());
-  CMyComPtr<ISequentialInStream> in(in_buf);
-  CMyComPtr<ISequentialOutStream> out(out_buf);
-
-  if (c.Code(in, out, NULL, NULL, NULL) != S_OK) {
-  }
-
-  std::vector<char> deflated(out_buf->GetSize());
-  memcpy(&deflated[0], out_buf->GetBuffer(), deflated.size());
-
-  return deflated;
-}
-
-std::vector<char> deflate_zlib(std::vector<char>& inflated) {
+std::vector<char> inflate_zlib(std::vector<char>& deflated) {
   z_stream strm;
   strm.zalloc = Z_NULL;
   strm.zfree = Z_NULL;
   strm.opaque = Z_NULL;
+  strm.next_in = (Bytef*)&deflated[0];
+  strm.avail_in = deflated.size();
+  std::vector<char> inflated;
+  std::vector<char> temp(65535);
 
-  // TODO: It might make sense to keep the zlib stream 
-  // around and reinitialize it using deflateReset.
-  if (deflateInit2(&strm, wolf.zlib_level, Z_DEFLATED,
-    wolf.zlib_windowBits, wolf.zlib_memLevel,
-    wolf.zlib_strategy) != Z_OK) {
-    abort();
-  }
+  if (inflateInit(&strm) != Z_OK)
+    goto error;
 
-  strm.next_in = (Bytef*)&inflated[0];
-  strm.avail_in = inflated.size();
+  do {
+      strm.avail_out = temp.size();
+      strm.next_out = (Bytef*)&temp[0];
+      int ret = inflate(&strm, Z_NO_FLUSH);
 
-  size_t max = deflateBound(&strm, inflated.size());
-  std::vector<char> new_deflated(max);
+      // TODO: going to `error` here probably leaks some memory
+      // but it would be freed when exiting the process, so this
+      // is mostly important when turning this into a library.
+      if (ret != Z_STREAM_END && ret != Z_OK)
+        goto error;
 
-  strm.next_out = (Bytef*)&new_deflated[0];
-  strm.avail_out = max;
+      size_t have = temp.size() - strm.avail_out;
+      inflated.insert(inflated.end(),
+        temp.begin(), temp.begin() + have);
 
-  // TODO: aborting here probably leaks memory
-  if (deflate(&strm, Z_FINISH) != Z_STREAM_END)
-    abort();
+  } while (strm.avail_out == 0);
 
-  deflateEnd(&strm);
+  if (inflateEnd(&strm) != Z_OK)
+    goto error;
 
-  new_deflated.resize(max - strm.avail_out);
+  return inflated;
 
-  return new_deflated;
+error:
+  // TODO: ...
+  abort();
+  return inflated;
 }
 
-std::vector<char> PngWolf::refilter(PngFilterGenome& ge) {
+std::vector<char> PngWolf::refilter(const PngFilterGenome& ge) {
   std::vector<char> refiltered(original_unfiltered.size());
 
   filter_idat((unsigned char*)&original_unfiltered[0],
@@ -574,8 +647,22 @@ float Evaluator(GAGenome& genome) {
 
   wolf.genomes_evaluated++;
 
-  std::vector<char> filtered = wolf.refilter(ge);
-  std::vector<char> deflated = deflate_zlib(filtered);
+  if (wolf.flt_singles.begin() == wolf.flt_singles.end()) {
+    // TODO: ...
+    abort();
+  }
+
+  // TODO: it would be better to do this incrementally.
+
+  std::vector<char> filtered(wolf.original_unfiltered.size());
+
+  for (int row = 0; row < ge.size(); ++row) {
+    size_t pos = wolf.scanline_width * row;
+    memcpy(&filtered[pos],
+      &wolf.flt_singles[ge.gene(row)][pos], wolf.scanline_width);
+  }
+
+  std::vector<char> deflated = wolf.deflate_fast->deflate(filtered);
 
   return float(deflated.size());
 }
@@ -587,12 +674,16 @@ unsigned sum_abs(unsigned c1, unsigned char c2) {
   return c1 + (c2 < 128 ? c2 : 256 - c2);
 }
 
+////////////////////////////////////////////////////////////////////
+// Logging
+////////////////////////////////////////////////////////////////////
 void PngWolf::log_genome(PngFilterGenome* ge) {
   for (int gix = 0; gix < ge->size(); ++gix) {
     if (gix % 72 == 0)
-      printf("\n    ");
-    printf("%1d", ge->gene(gix));
+      fprintf(stdout, "\n    ");
+    fprintf(stdout, "%1d", ge->gene(gix));
   }
+  fprintf(stdout, "\n");
 }
 
 void PngWolf::log_summary() {
@@ -600,10 +691,9 @@ void PngWolf::log_summary() {
   int diff = original_deflated.size() - best_deflated.size();
 
   if (verbose_summary) {
-    printf("best filter sequence found:");
+    fprintf(stdout, "best filter sequence found:");
     log_genome(best_genomes.back());
-    printf("\n");
-    printf(""
+    fprintf(stdout, ""
       "best zlib deflated idat size: %0.0f\n"
       "total time spent optimizing:  %0.0f\n"
       "number of genomes evaluated:  %u\n"
@@ -617,16 +707,16 @@ void PngWolf::log_summary() {
   }
 
   if (diff >= 0)
-    printf("# %u bytes smaller\n", diff);
+    fprintf(stdout, "# %u bytes smaller\n", diff);
   else
-    printf("# %u bytes bigger\n", abs(diff));
+    fprintf(stdout, "# %u bytes bigger\n", abs(diff));
 
   fflush(stdout);
 }
 
 void PngWolf::log_analysis() {
 
-  printf("---\n"
+  fprintf(stdout, "---\n"
     "# %u x %u pixels at depth %u (mode %u) with IDAT %u bytes (%u deflated)\n",
     ihdr.width, ihdr.height, ihdr.depth, ihdr.color,
     original_inflated.size(), original_deflated.size());
@@ -634,7 +724,7 @@ void PngWolf::log_analysis() {
   if (!verbose_analysis)
     return;
 
-  printf(""
+  fprintf(stdout, ""
     "image file path:    %s\n"
     "width in pixels:    %u\n"
     "height in pixels:   %u\n"
@@ -664,37 +754,37 @@ void PngWolf::log_analysis() {
     // Also, since no validation is performed for the types, it
     // is possible to break the YAML output with bad files, but
     // that does not seem all that important at the moment.
-    printf("%c", (c_it->type >> 24));
-    printf("%c", (c_it->type >> 16));
-    printf("%c", (c_it->type >> 8));
-    printf("%c", (c_it->type >> 0));
-    printf(" ");
+    fprintf(stdout, "%c", (c_it->type >> 24));
+    fprintf(stdout, "%c", (c_it->type >> 16));
+    fprintf(stdout, "%c", (c_it->type >> 8));
+    fprintf(stdout, "%c", (c_it->type >> 0));
+    fprintf(stdout, " ");
   }
 
   if (ihdr.color == 6 && ihdr.depth == 8) {
-    printf("\ninvisible colors:\n");
+    fprintf(stdout, "\ninvisible colors:\n");
     std::map<uint32_t, size_t>::iterator it;
     uint32_t total = 0;
 
     // TODO: htonl is probably not right here
     for (it = invis_colors.begin(); it != invis_colors.end(); ++it) {
-      printf("  - %08X # %u times\n", htonl(it->first), it->second);
+      fprintf(stdout, "  - %08X # %u times\n", htonl(it->first), it->second);
       total += it->second;
     }
 
     bool skip = invis_colors.size() == 1
       && invis_colors.begin()->first == 0x00000000;
 
-    printf("  # %u pixels (%0.2f%%) are fully transparent\n",
+    fprintf(stdout, "  # %u pixels (%0.2f%%) are fully transparent\n",
       total, (double)total / ((double)ihdr.width * (double)ihdr.height));
 
     if (invis_colors.size() > 0 && !skip)
-      printf("  # --normalize-alpha changes them into transparent black\n");
+      fprintf(stdout, "  # --normalize-alpha changes them into transparent black\n");
   } else {
-    printf("\n");
+    fprintf(stdout, "\n");
   }
 
-  printf(""
+  fprintf(stdout, ""
     "zlib deflated idat sizes:\n"
     "  original filter:  %0.0f\n"
     "  none:             %0.0f\n"
@@ -707,41 +797,39 @@ void PngWolf::log_analysis() {
     "  distinct bigrams: %0.0f\n"
     "  incremental:      %0.0f\n"
     "  basic heuristic:  %0.0f\n",
-    this->ge_original->score(),
-    this->ge_all_none->score(),
-    this->ge_all_sub->score(),
-    this->ge_all_up->score(),
-    this->ge_all_avg->score(),
-    this->ge_all_paeth->score(),
-    this->ge_experiment1->score(),
-    this->ge_experiment2->score(),
-    this->ge_experiment3->score(),
-    this->ge_experiment4->score(),
-    this->ge_heuristic->score());
+    this->genomes["original"]->score(),
+    this->genomes["all set to none"]->score(),
+    this->genomes["all set to sub"]->score(),
+    this->genomes["all set to up"]->score(),
+    this->genomes["all set to avg"]->score(),
+    this->genomes["all set to paeth"]->score(),
+    this->genomes["deflate scanline"]->score(),
+    this->genomes["distinct bytes"]->score(),
+    this->genomes["distinct bigrams"]->score(),
+    this->genomes["incremental"]->score(),
+    this->genomes["heuristic"]->score());
 
-  printf("original filters:");
-  log_genome(this->ge_original);
-  printf("\nbasic heuristic filters:");
-  log_genome(this->ge_heuristic);
-  printf("\ndeflate scanline filters:");
-  log_genome(this->ge_experiment1);
-  printf("\ndistinct bytes filters:");
-  log_genome(this->ge_experiment2);
-  printf("\ndistinct bigrams filters:");
-  log_genome(this->ge_experiment3);
-  printf("\nincremental filters:");
-  log_genome(this->ge_experiment4);
-  printf("\n");
+  fprintf(stdout, "original filters:");
+  log_genome(this->genomes["original"]);
+  fprintf(stdout, "basic heuristic filters:");
+  log_genome(this->genomes["heuristic"]);
+  fprintf(stdout, "deflate scanline filters:");
+  log_genome(this->genomes["deflate scanline"]);
+  fprintf(stdout, "distinct bytes filters:");
+  log_genome(this->genomes["distinct bytes"]);
+  fprintf(stdout, "distinct bigrams filters:");
+  log_genome(this->genomes["distinct bigrams"]);
+  fprintf(stdout, "incremental filters:");
+  log_genome(this->genomes["incremental"]);
 
   fflush(stdout);
 }
 
-
 void PngWolf::log_critter(PngFilterGenome* curr_best) {
   PngFilterGenome* prev_best = best_genomes.back();
   
-  if (!this->verbose_critters) {
-    printf(""
+  if (!this->verbose_genomes) {
+    fprintf(stdout, ""
       "- zlib deflated idat size: %7u # %+5d bytes %+4.0f seconds\n",
       unsigned(curr_best->score()),
       signed(curr_best->score() - initial_pop.best().score()),
@@ -749,7 +837,7 @@ void PngWolf::log_critter(PngFilterGenome* curr_best) {
     return;
   }
 
-  printf(""
+  fprintf(stdout, ""
     "  ##########################################################################\n"
     "- zlib deflated idat size: %7u # %+5d bytes %+4.0f seconds since previous\n"
     "  ##########################################################################\n"
@@ -757,17 +845,6 @@ void PngWolf::log_critter(PngFilterGenome* curr_best) {
     "  zlib bytes since first generation:     %+d\n"
     "  seconds since program launch:          %+0.0f\n"
     "  seconds since previous improvement:    %+0.0f\n"
-    "  current zlib level:                     %u\n"
-    "  current zlib window bits:               %u\n"
-    "  current zlib memory level:              %u\n"
-    "  current zlib strategy:                  %u\n"
-    "  current size of the population:         %u\n"
-    "  current objective score sum:            %0.0f\n"
-    "  current objective score average:        %0.0f\n"
-    "  current objective score stddev:         %0.0f\n"
-    "  current objective score variance:       %0.0f\n"
-    "  current objective score minimum:        %0.0f\n"
-    "  current objective score maximum:        %0.0f\n"
     "  current generation is the nth:          %u\n"
     "  number of genomes evaluated:            %u\n"
     "  best filters so far:",
@@ -778,23 +855,10 @@ void PngWolf::log_critter(PngFilterGenome* curr_best) {
     signed(curr_best->score() - best_genomes.front()->score()),
     difftime(time(NULL), program_begun_at),
     difftime(time(NULL), last_improvement_at),
-    zlib_level,
-    zlib_windowBits,
-    zlib_memLevel,
-    zlib_strategy,
-    ga->population().size(),
-    ga->population().sum(),
-    ga->population().ave(),
-    ga->population().dev(),
-    ga->population().var(),
-    ga->population().min(),
-    ga->population().max(),
     nth_generation,
     genomes_evaluated);
 
   log_genome(curr_best);
-
-  printf("\n");
   fflush(stdout);
 };
 
@@ -808,38 +872,42 @@ void PngWolf::init_filters() {
 
   // TODO: Can clone fail? What do we do then?
 
-  this->ge_all_avg = (PngFilterGenome*)ge.clone();
-  this->ge_all_none = (PngFilterGenome*)ge.clone();
-  this->ge_all_sub = (PngFilterGenome*)ge.clone();
-  this->ge_all_up = (PngFilterGenome*)ge.clone();
-  this->ge_all_paeth = (PngFilterGenome*)ge.clone();
-  this->ge_original = (PngFilterGenome*)ge.clone();
-  this->ge_heuristic = (PngFilterGenome*)ge.clone();
-  this->ge_experiment1 = (PngFilterGenome*)ge.clone();
-  this->ge_experiment2 = (PngFilterGenome*)ge.clone();
-  this->ge_experiment3 = (PngFilterGenome*)ge.clone();
-  this->ge_experiment4 = (PngFilterGenome*)ge.clone();
+  genomes["all set to avg"] = (PngFilterGenome*)ge.clone();
+  genomes["all set to none"] = (PngFilterGenome*)ge.clone();
+  genomes["all set to sub"] = (PngFilterGenome*)ge.clone();
+  genomes["all set to up"] = (PngFilterGenome*)ge.clone();
+  genomes["all set to paeth"] = (PngFilterGenome*)ge.clone();
+  genomes["original"] = (PngFilterGenome*)ge.clone();
+  genomes["heuristic"] = (PngFilterGenome*)ge.clone();
+  genomes["deflate scanline"] = (PngFilterGenome*)ge.clone();
+  genomes["distinct bytes"] = (PngFilterGenome*)ge.clone();
+  genomes["distinct bigrams"] = (PngFilterGenome*)ge.clone();
+  genomes["incremental"] = (PngFilterGenome*)ge.clone();
 
   for (int i = 0; i < ge.size(); ++i) {
-    ge_original->gene(i, original_filters[i]);
-    ge_all_avg->gene(i, Avg);
-    ge_all_sub->gene(i, Sub);
-    ge_all_none->gene(i, None);
-    ge_all_paeth->gene(i, Paeth);
-    ge_all_up->gene(i, Up);
+    genomes["original"]->gene(i, original_filters[i]);
+    genomes["all set to avg"]->gene(i, Avg);
+    genomes["all set to sub"]->gene(i, Sub);
+    genomes["all set to none"]->gene(i, None);
+    genomes["all set to paeth"]->gene(i, Paeth);
+    genomes["all set to up"]->gene(i, Up);
   }
 
-  std::vector<char> singles[] = {
-    refilter(*ge_all_none),
-    refilter(*ge_all_sub),
-    refilter(*ge_all_up),
-    refilter(*ge_all_avg),
-    refilter(*ge_all_paeth)
-  };
+  flt_singles[None] = refilter(*genomes["all set to none"]);
+  flt_singles[Sub] = refilter(*genomes["all set to sub"]);
+  flt_singles[Up] = refilter(*genomes["all set to up"]);
+  flt_singles[Avg] = refilter(*genomes["all set to avg"]);
+  flt_singles[Paeth] = refilter(*genomes["all set to paeth"]);
+
+  typedef std::map< PngFilter, std::vector<char> >::iterator flt_iter;
+
+  // TODO: for bigger_is_better it might make sense to have a
+  // function for the comparisons and set that so heuristics
+  // also work towards making the selection worse.
 
   for (int row = 0; row < ge.size(); ++row) {
-    int best_sum = INT_MAX;
-    int best_flt = 0;
+    size_t best_sum = SIZE_MAX;
+    PngFilter best_flt = None;
 
     // "The following simple heuristic has performed well in
     // early tests: compute the output scanline using all five
@@ -857,11 +925,12 @@ void PngWolf::init_filters() {
     // much evidence to support "usually". A better heuristic
     // would be applying the heuristic and None to all and use
     // the combination that performs better.
-    for (int flt = 0; flt< 5; ++flt) {
-      std::vector<char>::iterator scanline =
-        singles[flt].begin() + row * scanline_width;
 
-      int sum = std::accumulate(scanline + 1,
+    for (flt_iter fi = flt_singles.begin(); fi != flt_singles.end(); ++fi) {
+      std::vector<char>::iterator scanline =
+        flt_singles[fi->first].begin() + row * scanline_width;
+
+      size_t sum = std::accumulate(scanline + 1,
         scanline + scanline_width, 0, sum_abs);
 
       // If, for this scanline, the current filter is better
@@ -871,10 +940,10 @@ void PngWolf::init_filters() {
         continue;
 
       best_sum = sum;
-      best_flt = flt;
+      best_flt = fi->first;
     }
 
-    ge_heuristic->gene(row, (PngFilter)best_flt);
+    genomes["heuristic"]->gene(row, (PngFilter)best_flt);
   }
 
   // As an experimental heuristic, this compresses each scanline
@@ -886,37 +955,38 @@ void PngWolf::init_filters() {
   // small images. In the standard Alexa 1000 sample it performs
   // better than the specification's heuristic in 73% of cases;
   // files would be around 3% (median) and 4% (mean) smaller.
-  for (int row = 0; row < ge.size(); ++row) {
-    int best_sum = INT_MAX;
-    int best_flt = 0;
 
-    for (int flt = 0; flt < 5; ++flt) {
+  for (int row = 0; row < ge.size(); ++row) {
+    size_t best_sum = SIZE_MAX;
+    PngFilter best_flt = None;
+
+    for (flt_iter fi = flt_singles.begin(); fi != flt_singles.end(); ++fi) {
       std::vector<char>::iterator scanline =
-        singles[flt].begin() + row * scanline_width;
+        flt_singles[fi->first].begin() + row * scanline_width;
 
       std::vector<char> line(scanline, scanline + scanline_width);
-      int sum = deflate_zlib(line).size();
+      size_t sum = deflate_fast->deflate(line).size();
 
       if (sum >= best_sum)
         continue;
 
       best_sum = sum;
-      best_flt = flt;
+      best_flt = fi->first;
     }
 
-    ge_experiment1->gene(row, (PngFilter)best_flt);
+    genomes["deflate scanline"]->gene(row, (PngFilter)best_flt);
   }
 
   // unigram heuristic
   for (int row = 0; row < ge.size(); ++row) {
-    size_t best_sum = INT_MAX;
-    int best_flt = 0;
+    size_t best_sum = SIZE_MAX;
+    PngFilter best_flt = None;
 
-    for (int flt = 0; flt< 5; ++flt) {
+    for (flt_iter fi = flt_singles.begin(); fi != flt_singles.end(); ++fi) {
       std::bitset<65536> seen;
       std::vector<char>::iterator it;
       std::vector<char>::iterator scanline =
-        singles[flt].begin() + row * scanline_width;
+        flt_singles[fi->first].begin() + row * scanline_width;
 
       for (it = scanline; it < scanline + scanline_width; ++it)
         seen.set(uint8_t(*it));
@@ -927,22 +997,22 @@ void PngWolf::init_filters() {
         continue;
 
       best_sum = sum;
-      best_flt = flt;
+      best_flt = fi->first;
     }
 
-    ge_experiment2->gene(row, (PngFilter)best_flt);
+    genomes["distinct bytes"]->gene(row, (PngFilter)best_flt);
   }
 
   // bigram heuristic
   for (int row = 0; row < ge.size(); ++row) {
-    size_t best_sum = INT_MAX;
-    int best_flt = 0;
+    size_t best_sum = SIZE_MAX;
+    PngFilter best_flt = None;
 
-    for (int flt = 0; flt< 5; ++flt) {
+    for (flt_iter fi = flt_singles.begin(); fi != flt_singles.end(); ++fi) {
       std::bitset<65536> seen;
       std::vector<char>::iterator it;
       std::vector<char>::iterator scanline =
-        singles[flt].begin() + row * scanline_width;
+        flt_singles[fi->first].begin() + row * scanline_width;
 
       for (it = scanline + 1; it < scanline + scanline_width; ++it)
         seen.set((uint8_t(*(it - 1)) << 8) | uint8_t(*it));
@@ -953,10 +1023,10 @@ void PngWolf::init_filters() {
         continue;
 
       best_sum = sum;
-      best_flt = flt;
+      best_flt = fi->first;
     }
 
-    ge_experiment3->gene(row, (PngFilter)best_flt);
+    genomes["distinct bigrams"]->gene(row, (PngFilter)best_flt);
   }
 
   z_stream strm;
@@ -964,9 +1034,9 @@ void PngWolf::init_filters() {
   strm.zfree = Z_NULL;
   strm.opaque = Z_NULL;
 
-  if (deflateInit2(&strm, wolf.zlib_level, Z_DEFLATED,
-    wolf.zlib_windowBits, wolf.zlib_memLevel,
-    wolf.zlib_strategy) != Z_OK) {
+  if (deflateInit2(&strm, zlib_level, Z_DEFLATED,
+    zlib_windowBits, zlib_memLevel,
+    zlib_strategy) != Z_OK) {
     abort();
   }
 
@@ -978,15 +1048,15 @@ void PngWolf::init_filters() {
   for (int row = 0; row < ge.size(); ++row) {
     size_t pos = row * scanline_width;
     size_t best_sum = INT_MAX;
-    int best_flt = 0;
+    PngFilter best_flt = None;
 
-    for (int flt = 0; flt< 5; ++flt) {
+    for (flt_iter fi = flt_singles.begin(); fi != flt_singles.end(); ++fi) {
       z_stream here;
 
       if (deflateCopy(&here, &strm) != Z_OK) {
       }
 
-      here.next_in = (Bytef*)&singles[flt][pos];
+      here.next_in = (Bytef*)&flt_singles[fi->first][pos];
       here.avail_in = scanline_width;
 
       int status = deflate(&here, Z_FINISH);
@@ -1001,11 +1071,11 @@ void PngWolf::init_filters() {
         continue;
 
       best_sum = sum;
-      best_flt = flt;
+      best_flt = fi->first;
     }
 
-    ge_experiment4->gene(row, (PngFilter)best_flt);
-    strm.next_in = (Bytef*)&singles[best_flt][pos];
+    genomes["incremental"]->gene(row, (PngFilter)best_flt);
+    strm.next_in = (Bytef*)&flt_singles[(PngFilter)best_flt][pos];
     strm.avail_in = scanline_width;
 
     if (deflate(&strm, Z_NO_FLUSH) != Z_OK) {
@@ -1029,48 +1099,40 @@ void PngWolf::init_filters() {
   // critters. Maybe the Wolf should have a second population that
   // owns them, that way the default deallocator should handle them.
 
-  ge_all_none->evaluate();
-  ge_all_sub->evaluate();
-  ge_all_up->evaluate();
-  ge_all_avg->evaluate();
-  ge_all_paeth->evaluate();
-  ge_original->evaluate();
-  ge_heuristic->evaluate();
-  ge_experiment1->evaluate();
-  ge_experiment2->evaluate();
-  ge_experiment3->evaluate();
-  ge_experiment4->evaluate();
+  typedef std::map<std::string, PngFilterGenome*>::iterator ge_iter;
+  for (ge_iter i = genomes.begin(); i != genomes.end(); ++i)
+    i->second->evaluate();
 
   if (!exclude_singles) {
-    initial_pop.add(*this->ge_all_none);
-    initial_pop.add(*this->ge_all_sub);
-    initial_pop.add(*this->ge_all_up);
-    initial_pop.add(*this->ge_all_avg);
-    initial_pop.add(*this->ge_all_paeth);
+    initial_pop.add(*this->genomes["all set to none"]);
+    initial_pop.add(*this->genomes["all set to sub"]);
+    initial_pop.add(*this->genomes["all set to up"]);
+    initial_pop.add(*this->genomes["all set to avg"]);
+    initial_pop.add(*this->genomes["all set to paeth"]);
   }
 
   if (!exclude_original)
-    initial_pop.add(*this->ge_original);
+    initial_pop.add(*this->genomes["original"]);
 
   if (!exclude_heuristic)
-    initial_pop.add(*this->ge_heuristic);
+    initial_pop.add(*this->genomes["heuristic"]);
 
   if (!exclude_experiment1)
-    initial_pop.add(*this->ge_experiment1);
+    initial_pop.add(*this->genomes["deflate scanline"]);
 
   if (!exclude_experiment2)
-    initial_pop.add(*this->ge_experiment2);
+    initial_pop.add(*this->genomes["distinct bytes"]);
 
   if (!exclude_experiment3)
-    initial_pop.add(*this->ge_experiment3);
+    initial_pop.add(*this->genomes["distinct bigrams"]);
 
   if (!exclude_experiment4)
-    initial_pop.add(*this->ge_experiment4);
+    initial_pop.add(*this->genomes["incremental"]);
 
   // If all standard genomes have been excluded a randomized one has
   // to be added so the population knows how to make more genomes.
   if (initial_pop.size() == 0) {
-    PngFilterGenome clone(*ge_original);
+    PngFilterGenome clone(*genomes["original"]);
     clone.initialize();
     initial_pop.add(clone);
   }
@@ -1087,6 +1149,9 @@ void PngWolf::init_filters() {
   // This defines ordering by score (idat size in our case). Lower
   // idat size is better than higher idat size, setting accordingly.
   initial_pop.order(GAPopulation::LOW_IS_BEST);
+
+  if (bigger_is_better)
+    initial_pop.order(GAPopulation::HIGH_IS_BEST);
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -1124,12 +1189,12 @@ void PngWolf::run() {
   best_genomes.push_back((PngFilterGenome*)
     ga.population().best().clone());
 
-  printf("---\n");
+  fprintf(stdout, "---\n");
 
   if (ihdr.height == 1)
     goto after_while;
 
-  while (!wolf.should_abort) {
+  while (!should_abort) {
 
     double since_start = difftime(time(NULL), program_begun_at);
     double since_last = difftime(time(NULL), last_improvement_at);
@@ -1152,11 +1217,19 @@ void PngWolf::run() {
     ga.step();
     last_step_at = time(NULL);
 
+    if (should_abort)
+      break;
+
     PngFilterGenome& new_best =
       (PngFilterGenome&)ga.population().best();
 
-    if (new_best.score() >= best_genomes.back()->score())
-      continue;
+    if (!bigger_is_better)
+      if (new_best.score() >= best_genomes.back()->score())
+        continue;
+
+    if (bigger_is_better)
+      if (new_best.score() <= best_genomes.back()->score())
+        continue;
 
     log_critter(&new_best);
 
@@ -1168,14 +1241,13 @@ after_while:
 
   // Since we intercept CTRL+C the user should get some feedback
   // on that as soon as possible, so the log header comes here.
-  printf("---\n");
+  fprintf(stdout, "---\n");
   fflush(stdout);
 }
 
 void PngWolf::recompress() {
   best_inflated = refilter(*best_genomes.back());
-  best_deflated = deflate_7zip(best_inflated,
-    1, szip_pass, szip_fast, szip_cycl);
+  best_deflated = deflate_good->deflate(best_inflated);
 
   // In my test sample in 1.66% of cases, using a high zlib level,
   // zlib is able to produce smaller output than 7-Zip. So for the
@@ -1189,7 +1261,22 @@ void PngWolf::recompress() {
   // what compressor was used and give the respective sizes.
 
   if (best_deflated.size() > best_genomes.back()->score()) {
-    best_deflated = deflate_zlib(best_inflated);
+    best_deflated = deflate_fast->deflate(best_inflated);
+  }
+
+  // TODO: Doing this here is a bit of an hack, and doing it
+  // should also be logged in the verbose output. Main problem
+  // is separation of things you'd put into a library and what
+  // is really more part of the command line application. Right
+  // now run() should really do this, but then you could not
+  // abort 7zip easily. Also not sure what --best-idat-to ought
+  // to do here. Might end up exposing a step() method and let
+  // the command line part do logging and other things.
+
+  if (best_deflated.size() > original_deflated.size() && !even_if_bigger) {
+    best_genomes.push_back(genomes["original"]);
+    best_inflated = original_inflated;
+    best_deflated = original_deflated;
   }
 
   done_deflating_at = time(NULL);
@@ -1197,45 +1284,33 @@ void PngWolf::recompress() {
 
 bool PngWolf::read_file() {
 
-  FILE* file;
   char fileMagic[8];
-  std::vector<char> temp(65535);
   unsigned int iend_chunk_count = 0;
   size_t expected;
 
-  file = fopen(this->in_path, "rb");
-
-  if (file == NULL)
-    return true;
-
-  if (fread(fileMagic, 8, 1, file) != 1)
-    goto error;
+  std::ifstream in;
+  in.exceptions(std::ios::badbit | std::ios::failbit);
+  in.open(in_path, std::ios::binary | std::ios::in);
+  in.read(fileMagic, 8);
 
   if (memcmp(fileMagic, PNG_MAGIC, 8) != 0)
     goto error;
 
-  while (!feof(file)) {
+  while (!in.eof()) {
     PngChunk chunk;
 
-    // TODO: This is not quite right if there are stray bytes
-    // (less than the required four) at the end of the file.
-    if (fread(&chunk.size, sizeof(chunk.size), 1, file) != 1)
-      break;
-
+    in.read((char*)&chunk.size, sizeof(chunk.size));
     chunk.size = ntohl(chunk.size);
 
-    if (fread(&chunk.type, sizeof(chunk.type), 1, file) != 1)
-      goto error;
-
+    in.read((char*)&chunk.type, sizeof(chunk.type));
     chunk.type = ntohl(chunk.type);
-    chunk.data.resize(chunk.size);
 
-    if (chunk.size > 0)
-      if (fread(&chunk.data[0], chunk.size, 1, file) != 1)
-        goto error;
+    if (chunk.size > 0) {
+      chunk.data.resize(chunk.size);
+      in.read((char*)&chunk.data[0], chunk.size);
+    }
 
-    if (fread(&chunk.crc32, sizeof(chunk.crc32), 1, file) != 1)
-      goto error;
+    in.read((char*)&chunk.crc32, sizeof(chunk.crc32));
 
     chunk.crc32 = ntohl(chunk.crc32);
 
@@ -1268,10 +1343,12 @@ bool PngWolf::read_file() {
       iend_chunk_count++;
 
     chunks.push_back(chunk);
+
+    // Peek so the eof check works as expected.
+    in.peek();
   }
 
-  fclose(file);
-  file = NULL;
+  in.close();
 
   // We can't do anything if there is no image data in the input.
   if (original_deflated.size() == 0)
@@ -1319,35 +1396,7 @@ bool PngWolf::read_file() {
   if (channel_map[ihdr.color] < 1)
     goto error;
 
-  z_stream strm;
-  strm.zalloc = Z_NULL;
-  strm.zfree = Z_NULL;
-  strm.opaque = Z_NULL;
-  strm.next_in = (Bytef*)&original_deflated[0];
-  strm.avail_in = original_deflated.size();
-
-  if (inflateInit(&strm) != Z_OK)
-    goto error;
-
-  do {
-      strm.avail_out = temp.size();
-      strm.next_out = (Bytef*)&temp[0];
-      int ret = inflate(&strm, Z_NO_FLUSH);
-
-      // TODO: going to `error` here probably leaks some memory
-      // but it would be freed when exiting the process, so this
-      // is mostly important when turning this into a library.
-      if (ret != Z_STREAM_END && ret != Z_OK)
-        goto error;
-
-      size_t have = temp.size() - strm.avail_out;
-      original_inflated.insert(original_inflated.end(),
-        temp.begin(), temp.begin() + have);
-
-  } while (strm.avail_out == 0);
-
-  if (inflateEnd(&strm) != Z_OK)
-    goto error;
+  original_inflated = inflate_zlib(original_deflated);
 
   expected = ihdr.height * int(ceil(
     float(((ihdr.width * channel_map[ihdr.color] * ihdr.depth + 8) / 8.0f))
@@ -1406,11 +1455,21 @@ bool PngWolf::read_file() {
     }
   }
 
+  // For very large images the highest 7-Zip setting requires too
+  // much time to be worth the saved bytes, especially as `pngout`
+  // performs better for such images, at least if they are highly
+  // redundant, anyway, so this option allows picking the highest
+  // setting for small images while not requiring users to wait a
+  // very long time for the compressed result. TODO: maybe the
+  // base value should configurable.
+  if (auto_mpass) {
+    double times = double(original_inflated.size()) / (64*1024.f);
+    szip_pass = 16 - std::max(1, int(floor(times)));
+  }
+
   return false;
 
 error:
-  if (file != NULL)
-    fclose(file);
 
   return true;
 }
@@ -1549,7 +1608,7 @@ bool PngWolf::save_file() {
 ////////////////////////////////////////////////////////////////////
 void
 help(void) {
-  printf("%s",
+  fprintf(stdout, "%s",
     " -----------------------------------------------------------------------------\n"
     " Usage: pngwolf --in=file.png --out=file.png                                  \n"
     " -----------------------------------------------------------------------------\n"
@@ -1571,13 +1630,15 @@ help(void) {
     "  --zlib-window=<int>            zlib estimator window bits (default: 15)     \n"
     "  --zlib-memlevel=<int>          zlib estimator memory level (default: 8)     \n"
     "  --7zip-mfb=<int>               7zip fast bytes 3..258 (default: 258)        \n"
-    "  --7zip-mpass=<int>             7zip passes 0..15 (d: 2; > ~ slower, smaller)\n"
+    "  --7zip-mpass=<int|auto>        7zip passes 0..15 (d: 2; > ~ slower, smaller)\n"
     "  --7zip-mmc=<int>               7zip match finder cycles (d: 258)            \n"
     "  --verbose-analysis             More details in initial image analysis       \n"
     "  --verbose-summary              More details in optimization summary         \n"
-    "  --verbose-critter              More details when improvements are found     \n"
+    "  --verbose-genomes              More details when improvements are found     \n"
     "  --verbose                      Shorthand for all verbosity options          \n"
     "  --normalize-alpha              For RGBA, make fully transparent pixels black\n"
+    "  --even-if-bigger               Otherwise the original is copied if it's best\n"
+    "  --bigger-is-better             Find filter sequences that compress worse    \n"
     "  --info                         Just print out verbose analysis and exit     \n"
     "  --help                         Print this help page and exit                \n"
     " -----------------------------------------------------------------------------\n"
@@ -1611,7 +1672,7 @@ main(int argc, char *argv[]) {
   bool argHelp = false;
   bool argVerboseAnalysis = false;
   bool argVerboseSummary = false;
-  bool argVerboseCritters = false;
+  bool argVerboseGenomes = false;
   bool argExcludeSingles = false;
   bool argExcludeOriginal = false;
   bool argExcludeHeuristic = false;
@@ -1621,6 +1682,9 @@ main(int argc, char *argv[]) {
   bool argExcludeExperiment4 = false;
   bool argInfo = false;
   bool argNormalizeAlpha = false;
+  bool argEvenIfBigger = false;
+  bool argAutoMpass = false;
+  bool argBiggerIsBetter = false;
   const char* argPng = NULL;
   const char* argOut = NULL;
   const char* argBestIdatTo = NULL;
@@ -1664,8 +1728,8 @@ main(int argc, char *argv[]) {
       argVerboseSummary = true;
       continue;
 
-    } else if (strcmp("--verbose-critters", s) == 0) {
-      argVerboseCritters = true;
+    } else if (strcmp("--verbose-genomes", s) == 0) {
+      argVerboseGenomes = true;
       continue;
 
     } else if (strcmp("--exclude-original", s) == 0) {
@@ -1683,7 +1747,7 @@ main(int argc, char *argv[]) {
     } else if (strcmp("--verbose", s) == 0) {
       argVerboseAnalysis = true;
       argVerboseSummary = true;
-      argVerboseCritters = true;
+      argVerboseGenomes = true;
       continue;
 
     } else if (strcmp("--info", s) == 0) {
@@ -1693,6 +1757,14 @@ main(int argc, char *argv[]) {
 
     } else if (strcmp("--normalize-alpha", s) == 0) {
       argNormalizeAlpha = true;
+      continue;
+
+    } else if (strcmp("--even-if-bigger", s) == 0) {
+      argEvenIfBigger = true;
+      continue;
+
+    } else if (strcmp("--bigger-is-better", s) == 0) {
+      argBiggerIsBetter = true;
       continue;
 
     } else if (strcmp("--exclude-experiments", s) == 0) {
@@ -1769,9 +1841,13 @@ main(int argc, char *argv[]) {
       argOkay &= arg7zipFastBytes <= 258;
 
     } else if (strncmp("--7zip-mpass", s, nlen) == 0) {
-      arg7zipPasses = atoi(value);
-      argOkay &= arg7zipPasses >= 1;
-      argOkay &= arg7zipPasses <= 15;
+      if (strcmp(value, "auto") == 0) {
+        argAutoMpass = true;
+      } else {
+        arg7zipPasses = atoi(value);
+        argOkay &= arg7zipPasses >= 1;
+        argOkay &= arg7zipPasses <= 15;
+      }
 
     } else if (strncmp("--7zip-mmc", s, nlen) == 0) {
       arg7zipCycles = atoi(value);
@@ -1787,11 +1863,23 @@ main(int argc, char *argv[]) {
     return EXIT_SUCCESS;
   }
 
+  DeflateZlib fast(argZlibLevel, argZlibWindow, argZlibMemlevel, argZlibStrategy);
+  Deflate7zip good(arg7zipPasses, arg7zipFastBytes, arg7zipCycles);
+
+  wolf.szip_cycl = arg7zipCycles;
+  wolf.szip_fast = arg7zipFastBytes;
+  wolf.szip_pass = arg7zipPasses;
+  wolf.zlib_level = argZlibLevel;
+  wolf.zlib_memLevel = argZlibMemlevel;
+  wolf.zlib_strategy = argZlibStrategy;
+  wolf.zlib_windowBits = argZlibWindow;
+  wolf.deflate_fast = &fast;
+  wolf.deflate_good = &good;
   wolf.in_path = argPng;
   wolf.max_deflate = argMaxDeflate;
   wolf.max_evaluations = argMaxEvaluations;
   wolf.verbose_analysis = argVerboseAnalysis;
-  wolf.verbose_critters = argVerboseCritters;
+  wolf.verbose_genomes = argVerboseGenomes;
   wolf.verbose_summary = argVerboseSummary;
   wolf.exclude_heuristic = argExcludeHeuristic;
   wolf.exclude_original = argExcludeOriginal;
@@ -1807,14 +1895,10 @@ main(int argc, char *argv[]) {
   wolf.program_begun_at = time(NULL);
   wolf.max_time = argMaxTime;
   wolf.out_path = argOut;
-  wolf.zlib_level = argZlibLevel;
-  wolf.zlib_memLevel = argZlibMemlevel;
-  wolf.zlib_strategy = argZlibStrategy;
-  wolf.zlib_windowBits = argZlibWindow;
-  wolf.szip_fast = arg7zipFastBytes;
-  wolf.szip_pass = arg7zipPasses;
-  wolf.szip_cycl = arg7zipCycles;
   wolf.normalize_alpha = argNormalizeAlpha;
+  wolf.even_if_bigger = argEvenIfBigger;
+  wolf.auto_mpass = argAutoMpass;
+  wolf.bigger_is_better = argBiggerIsBetter;
 
   // TODO: ...
   try {
@@ -1874,15 +1958,15 @@ done:
 
 error:
   if (wolf.ihdr.interlace) {
-    printf("Interlaced images are not supported\n");
+    fprintf(stderr, "Interlaced images are not supported\n");
     return EXIT_FAILURE;
   }
 
-  printf("Some error occured while reading the input file\n");
+  fprintf(stderr, "Some error occured while reading the input file\n");
   return EXIT_FAILURE;
 
 out_error:
-  printf("Some error occured while writing an output file\n");
+  fprintf(stderr, "Some error occured while writing an output file\n");
   return EXIT_FAILURE;
 
 }
