@@ -52,6 +52,10 @@
 #include <map>
 #include <bitset>
 
+#ifndef SIZE_MAX
+#define SIZE_MAX ((size_t)-1)
+#endif
+
 #ifdef _MSC_VER
 #pragma warning(push, 4)
 #pragma warning(disable: 4996)
@@ -168,7 +172,7 @@ public:
   std::vector<char> original_unfiltered;
 
   // 
-  std::map<PngFilter, std::vector<char>> flt_singles;
+  std::map<PngFilter, std::vector<char> > flt_singles;
 
   //
   std::map<uint32_t, size_t> invis_colors;
